@@ -1,0 +1,12 @@
+discord.py==2.4.0
+PyNaCl==1.4.0
+audioop-lts; python_version>='3.13'
+yt-dlp
+requests
+pycountry
+newsapi-python
+praw
+spotipy
+google-api-python-client
+python-dotenv
+imageio-ffmpeg
