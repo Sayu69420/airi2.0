@@ -1,16 +1,15 @@
-import discord, datetime, random, yt_dlp, os, asyncio
-from discord.ext import commands
-from discord.voice_client import VoiceClient
+import discord, datetime, os
 import sqlite3
-from dotenv import load_dotenv
+import traceback
+from discord.ext import commands
 
-load_dotenv()
+import env_config
 
 def get_prefix(bot, msg):
     if not msg.guild:
         return commands.when_mentioned_or(".")(bot, msg)
     try:
-        with sqlite3.connect("config.db") as db:
+        with sqlite3.connect(env_config.DB_PATH) as db:
             cursor = db.cursor()
             cursor.execute("SELECT prefix FROM config WHERE guild_id = ?", (msg.guild.id,))
             row = cursor.fetchone()
@@ -25,17 +24,15 @@ intents.message_content = True
 
 class AiriBot(commands.Bot):
     async def setup_hook(self):
-        for filename in os.listdir('./cogs'):
+        for filename in os.listdir(env_config.BASE_DIR / 'cogs'):
             if filename.endswith('.py'):
                 await self.load_extension(f'cogs.{filename[:-3]}')
 
 client = AiriBot(command_prefix=get_prefix, intents=intents, help_command=None)
 
 def get_personal_channel():
-    raw_id = os.getenv('PERSONAL_CHANNEL_ID')
-    if raw_id and raw_id.isdigit():
-        return client.get_channel(int(raw_id))
-    return None
+    channel_id = env_config.get_id('PERSONAL_CHANNEL_ID')
+    return client.get_channel(channel_id) if channel_id else None
 
 @client.event
 async def on_ready():
@@ -66,13 +63,18 @@ async def on_guild_join(guild):
 async def on_command_error(ctx, error):
     if isinstance(error, commands.errors.CommandNotFound):
         return
-    import traceback
     print(f"Error in command '{ctx.command}': {error}")
     traceback.print_exception(type(error), error, error.__traceback__)
     if isinstance(error, commands.MissingPermissions):
         embed = discord.Embed(description="You don't have permissions to do that!", color=discord.Color.red())
         msg = await ctx.send(embed=embed)
         await msg.add_reaction("⚠")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(embed=discord.Embed(description=f"Missing required argument: `{error.param.name}`", color=discord.Color.red()))
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(embed=discord.Embed(description=f"Invalid argument: {error}", color=discord.Color.red()))
+    elif isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(embed=discord.Embed(description=f"This command is on cooldown, try again in {error.retry_after:.1f}s.", color=discord.Color.red()))
 
 @client.group(invoke_without_command=True)
 async def help(ctx):
@@ -91,8 +93,7 @@ async def help(ctx):
     embed.add_field(name='🎵| Music Commands',value=".help music",inline=True)
     embed.add_field(name="😸| Fun Commands",value=".help fun",inline=True)
     embed.add_field(name="⚙| Manage Server",value=".help server",inline=False)
-    embed.add_field(name="🧬| Covid-19",value=".help covid",inline=True)
-    embed.add_field(name="\u200b", value=f"[Add me to your server !](https://discord.com/api/oauth2/authorize?client_id=BOT_ID&permissions=0&scope=bot)",inline=False)
+    embed.add_field(name="\u200b", value="[Add me to your server !](https://discord.com/api/oauth2/authorize?client_id=BOT_ID&permissions=0&scope=bot)",inline=False)
     await ctx.send(embed=embed)
 
 @help.command(name="commands", aliases=["all", "list"])
@@ -179,17 +180,6 @@ async def show_all_commands(ctx):
         inline=False
     )
 
-    embed.add_field(
-        name="🧬 | Covid-19 Information",
-        value=(
-            "`.cinfo` - COVID-19 general information\n"
-            "`.cc [country]` - COVID-19 statistics by country\n"
-            "`.cmed` - General medicine & dosage list\n"
-            "`.cvac` - COVID-19 vaccination details and links"
-        ),
-        inline=False
-    )
-
     await ctx.send(embed=embed)
 
 @help.command()
@@ -207,21 +197,6 @@ async def music(ctx):
     embed.add_field(name="Queue",value="`.q` or `.queue` displays songs in a queue",inline=False)
     embed.add_field(name="Leave",value="`.leave` leaves the voice channel and clears the queue !",inline=False)
     embed.add_field(name="Liked Songs",value="Create your Own playlist of favourite songs !\nFor more info use `.help liked`",inline=False)
-    await ctx.send(embed=embed)
-
-@help.command()
-async def covid(ctx):
-    bot_roles = ctx.guild.get_member(client.user.id).roles
-    embed = discord.Embed(title= "🧬 | Covid-19 Help",description="Use `.<command name>` to activate !",color=bot_roles[len(bot_roles)-1].color)
-    embed.set_thumbnail(
-        url="https://media0.giphy.com/media/hubAFdn7wrjM3SVkq5/source.gif")
-
-    embed.add_field(name='😷 | About Covid',value="`.cinfo` Gives the Covid-19 information.",inline=False)
-    embed.add_field(name="📈 | Covid Cases",value="`.cc <country>` Use this command to get Covid-19 stats in a country (default:India)\nFor eg: cc usa to get Covid stats of United States",inline=False)
-    embed.add_field(name="🩹 | General Medicines",value="`.cmed` Gives general purpose Medicines name and their Dosage",inline=False)
-    embed.add_field(name="💉 | Vaccine Information",value="`.cvac` Gives information and important url related to Vaccination in India",inline=False)
-
-
     await ctx.send(embed=embed)
 
 @help.command()
@@ -282,24 +257,32 @@ async def ai_help(ctx):
     await ctx.send(embed=embed)
 # COGS
 
+# Owner-only: without the check, any user in any server could unload the bot's
+# cogs.
 @client.command()
+@commands.is_owner()
 async def load(ctx, extension):
     await client.load_extension(f'cogs.{extension}')
     await ctx.send(f"Loaded `cogs.{extension}`")
 
 @client.command()
+@commands.is_owner()
 async def unload(ctx, extension):
     await client.unload_extension(f'cogs.{extension}')
     await ctx.send(f"Unloaded `cogs.{extension}`")
 
 @client.command()
+@commands.is_owner()
 async def reload(ctx, extension):
     await client.reload_extension(f'cogs.{extension}')
     await ctx.send(f"Reloaded `cogs.{extension}`")
 
 # run command
-token = os.getenv('DISCORD_BOT_TOKEN')
+token = env_config.get('DISCORD_BOT_TOKEN')
 if token:
     client.run(token)
 else:
-    print("Error: DISCORD_BOT_TOKEN environment variable is missing in .env file.")
+    print(
+        "Error: DISCORD_BOT_TOKEN is missing.\n"
+        f"Copy .env.sample to {env_config.BASE_DIR / '.env'} and fill in your bot token."
+    )

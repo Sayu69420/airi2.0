@@ -2,18 +2,14 @@ import discord
 from discord.ext import commands
 import sqlite3
 
+import env_config
+
 class Config(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.db = sqlite3.connect("config.db")
+        # Schema lives in env_config.SCHEMA and is applied at startup.
+        self.db = sqlite3.connect(env_config.DB_PATH)
         self.cursor = self.db.cursor()
-        self.cursor.execute("""
-        CREATE TABLE IF NOT EXISTS config(
-            guild_id INT PRIMARY KEY,
-            prefix TEXT
-        )
-        """)
-        self.db.commit()
 
     @commands.command(name="prefix")
     async def _prefix(self, ctx, prefix: str = None):

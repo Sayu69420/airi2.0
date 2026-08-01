@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.local
+
+# Local state
+airi.db
+config.db
+fav_disc.db
+*.migrated
+*.db-journal
+Config.db.corrupt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Downloaded audio / cache
+*.webm
+*.m4a
+*.mp3
+*.part
