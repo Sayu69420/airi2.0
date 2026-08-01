@@ -1,9 +1,9 @@
-import discord, spotipy, sqlite3, asyncio, time, yt_dlp, random, os, shutil, re, requests
+import discord, spotipy, sqlite3, asyncio, time, yt_dlp, shutil, re, requests, json
 from discord.ext import commands
-from discord.ext.commands.core import command
 from spotipy.oauth2 import SpotifyClientCredentials
-from googleapiclient.discovery import build
 from datetime import datetime
+
+import env_config
 
 yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ''
 ydl_opts = {
@@ -34,6 +34,36 @@ FFMPEG_EXECUTABLE = get_ffmpeg_path()
 
 ytdl = yt_dlp.YoutubeDL(ydl_opts)
 
+BROWSER_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+SPOTIFY_HOSTS = ('spotify.com', 'spotify.link', 'spotify.app.link', 'spoti.fi', 'spotify:')
+
+# How many YouTube results to score before picking one.
+SEARCH_CANDIDATES = 6
+
+# Words that mark an upload as something other than the track that was asked
+# for. Only counted when the word isn't in the search query itself, so asking
+# for a live version still finds one.
+JUNK_TERMS = (
+    'live', 'cover', 'remix', 'nightcore', 'sped up', 'speed up', 'slowed', 'reverb',
+    'karaoke', 'instrumental', 'acoustic', '8d', 'mashup', 'reaction', 'tutorial',
+    'full album', 'compilation', 'megamix', 'best of', 'mix', 'loop', 'teaser',
+    'trailer', 'preview', 'ringtone', 'ai cover', 'concert', 'edit',
+)
+
+# Dropped before comparing a query against a video title — they carry no
+# identifying information and would inflate every candidate's overlap score.
+QUERY_STOPWORDS = {'the', 'a', 'an', 'of', 'and', 'feat', 'ft', 'official',
+                   'audio', 'video', 'lyrics', 'lyric', 'hd', 'hq', 'music'}
+
+
+def _tokens(text):
+    # \w keeps CJK/Cyrillic/accented titles, which an ASCII-only pattern would
+    # discard entirely — leaving every candidate with the same overlap score.
+    return {t for t in re.findall(r"[\w']+", str(text).lower(), re.UNICODE)
+            if t not in QUERY_STOPWORDS}
+
 
 class Test(commands.Cog):
     def __init__(self, client):
@@ -41,6 +71,9 @@ class Test(commands.Cog):
         # Dictionary storing guild-specific music player states:
         # { guild_id: { 'container': {...}, 'nowplaying': {...}, 'songlist': {...}, 'sent_id': {...} } }
         self.guilds = {}
+        # Search query -> the track's real length in seconds, taken from Spotify
+        # metadata and used to score YouTube results.
+        self._duration_hints = {}
 
     def _get_guild_id(self, target):
         if hasattr(target, 'guild') and target.guild:
@@ -67,158 +100,234 @@ class Test(commands.Cog):
         if gid in self.guilds:
             del self.guilds[gid]
 
+    # ─── Spotify link -> search queries ──────────────────────────────────────
+    @staticmethod
+    def _artist_name(artists):
+        """Flatten Spotify's several artist shapes into a plain string."""
+        if isinstance(artists, str):
+            names = artists
+        elif isinstance(artists, list):
+            names = ' '.join(a.get('name', '') if isinstance(a, dict) else str(a) for a in artists)
+        else:
+            return ''
+        return names.replace('\xa0', ' ').replace(',', ' ').strip()
+
+    def _remember_duration(self, query, seconds):
+        """Cache a track's real length so search_yt can score candidates by it."""
+        if len(self._duration_hints) > 2000:
+            self._duration_hints.clear()
+        self._duration_hints[query] = int(seconds)
+
+    def _track_query(self, title, artists, duration_ms=None):
+        """Build a YouTube search string and note the track's true length."""
+        title = str(title or '').replace('\xa0', ' ').strip()
+        if not title:
+            return None
+        query = f"{self._artist_name(artists)} {title}".strip()
+        if duration_ms:
+            self._remember_duration(query, duration_ms / 1000)
+        return query
+
     def extract_spotify_queries(self, url):
         clean_url = self.clean_spotify_url(url)
         if not clean_url:
             return []
-            
-        client_id = os.getenv('SPOTIFY_CLIENT_ID', '').strip()
-        client_secret = os.getenv('SPOTIFY_CLIENT_SECRET', '').strip()
+        return (self._spotify_api_queries(clean_url)
+                or self._spotify_embed_queries(clean_url)
+                or self._spotify_oembed_queries(clean_url))
 
-        # 1. Try Spotipy API if credentials are present
-        if client_id and client_secret:
-            try:
-                spotify = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(
-                    client_id=client_id, client_secret=client_secret))
-                path_parts = clean_url.split('/')
-                queries = []
-                if 'playlist' in path_parts:
-                    results = spotify.playlist_tracks(clean_url, market='IN')
-                    albums = results.get('items', []) if results else []
-                    while results and results.get('next'):
-                        results = spotify.next(results)
-                        if results and results.get('items'):
-                            albums.extend(results.get('items', []))
-                    for album in albums:
-                        if album and album.get('track'):
-                            sname = album['track']['name']
-                            artist = album['track']['artists'][0]['name'] if album['track'].get('artists') else 'Unknown'
-                            queries.append(f"{artist} {sname}".strip())
-                    if queries:
-                        return queries
-                elif 'track' in path_parts:
-                    results = spotify.track(clean_url, market="IN")
-                    sname = results['name']
-                    artist = results['artists'][0]['name'] if results.get('artists') else 'Unknown'
-                    return [f"{artist} {sname}".strip()]
-                elif 'album' in path_parts:
-                    results = spotify.album_tracks(clean_url, market="IN")
-                    items = results.get('items', []) if results else []
-                    while results and results.get('next'):
-                        results = spotify.next(results)
-                        if results and results.get('items'):
-                            items.extend(results.get('items', []))
-                    for item in items:
-                        sname = item['name']
-                        artist = item['artists'][0]['name'] if item.get('artists') else 'Unknown'
-                        queries.append(f"{artist} {sname}".strip())
-                    if queries:
-                        return queries
-            except Exception as e:
-                print(f"Spotipy API error: {e}, falling back to web extraction...")
+    @staticmethod
+    def _paginate(spotify, page):
+        """Collect the items from every page of a Spotify paged response."""
+        items = []
+        while page:
+            items.extend(page.get('items') or [])
+            page = spotify.next(page) if page.get('next') else None
+        return items
 
-        # 2. Embed page scraper fallback
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        embed_url = clean_url if '/embed/' in clean_url else clean_url.replace('open.spotify.com/', 'open.spotify.com/embed/')
-        queries = []
+    def _spotify_api_queries(self, url):
+        client_id = env_config.get('SPOTIFY_CLIENT_ID')
+        client_secret = env_config.get('SPOTIFY_CLIENT_SECRET')
+        if not (client_id and client_secret):
+            return []
         try:
-            resp = requests.get(embed_url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                json_matches = re.findall(r'<script[^>]*>({[\s\S]*?})</script>', resp.text)
-                for jm in json_matches:
-                    if 'props' in jm or 'entity' in jm or '__NEXT_DATA__' in jm:
-                        try:
-                            data = json.loads(jm)
-                            entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
-                            if not entity and 'props' in data:
-                                entity = data.get('props', {}).get('pageProps', {}).get('entity', {})
+            spotify = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(
+                client_id=client_id, client_secret=client_secret))
+            parts = url.split('/')
+            if 'track' in parts:
+                track = spotify.track(url, market='IN')
+                query = self._track_query(track.get('name'), track.get('artists'), track.get('duration_ms'))
+                return [query] if query else []
+            if 'playlist' in parts:
+                rows = self._paginate(spotify, spotify.playlist_tracks(url, market='IN'))
+                tracks = [row.get('track') for row in rows]
+            elif 'album' in parts:
+                tracks = self._paginate(spotify, spotify.album_tracks(url, market='IN'))
+            else:
+                return []
+            queries = [self._track_query(t.get('name'), t.get('artists'), t.get('duration_ms'))
+                       for t in tracks if t]
+            return [q for q in queries if q]
+        except Exception as e:
+            print(f"Spotipy API error: {e}, falling back to web extraction...")
+            return []
 
-                            entity_type = entity.get('type')
-                            if entity_type in ['playlist', 'album']:
-                                track_list = entity.get('trackList', []) or entity.get('tracks', {}).get('items', [])
-                                for t in track_list:
-                                    title = t.get('title') or t.get('name')
-                                    artists = t.get('artists') or t.get('subtitle') or t.get('artist')
-                                    artist_name = ""
-                                    if isinstance(artists, list) and artists:
-                                        names = [a.get('name', '') if isinstance(a, dict) else str(a) for a in artists]
-                                        artist_name = " ".join(names)
-                                    elif isinstance(artists, str):
-                                        artist_name = artists
-                                    artist_name = artist_name.replace('\xa0', ' ').replace(',', ' ').strip()
-                                    if title:
-                                        title = str(title).replace('\xa0', ' ').strip()
-                                        queries.append(f"{artist_name} {title}".strip())
-                                if queries:
-                                    return queries
-                            elif entity_type == 'track':
-                                title = entity.get('title') or entity.get('name')
-                                artists = entity.get('artists') or entity.get('subtitle')
-                                artist_name = ""
-                                if isinstance(artists, list) and artists:
-                                    names = [a.get('name', '') if isinstance(a, dict) else str(a) for a in artists]
-                                    artist_name = " ".join(names)
-                                elif isinstance(artists, str):
-                                    artist_name = artists
-                                artist_name = artist_name.replace('\xa0', ' ').replace(',', ' ').strip()
-                                if title:
-                                    title = str(title).replace('\xa0', ' ').strip()
-                                    return [f"{artist_name} {title}".strip()]
-                        except Exception:
-                            continue
+    def _spotify_embed_queries(self, url):
+        """Scrape the public embed page — works without API credentials."""
+        embed_url = url if '/embed/' in url else url.replace('open.spotify.com/', 'open.spotify.com/embed/')
+        try:
+            resp = requests.get(embed_url, headers={'User-Agent': BROWSER_UA}, timeout=10)
         except Exception as e:
             print(f"Embed extraction error: {e}")
+            return []
+        if resp.status_code != 200:
+            return []
 
-        # 3. oEmbed fallback
-        if not queries:
+        for blob in re.findall(r'<script[^>]*>({[\s\S]*?})</script>', resp.text):
+            if not any(k in blob for k in ('props', 'entity', '__NEXT_DATA__')):
+                continue
             try:
-                oembed_resp = requests.get(f"https://open.spotify.com/oembed?url={clean_url}", headers=headers, timeout=5)
-                if oembed_resp.status_code == 200:
-                    title = oembed_resp.json().get('title')
-                    if title:
-                        queries.append(title.replace('\xa0', ' ').strip())
-            except Exception as e:
-                print(f"oEmbed extraction error: {e}")
+                data = json.loads(blob)
+            except ValueError:
+                continue
+            page_props = data.get('props', {}).get('pageProps', {})
+            entity = page_props.get('state', {}).get('data', {}).get('entity', {}) or page_props.get('entity', {})
+            kind = entity.get('type')
 
-        return queries
+            if kind == 'track':
+                query = self._track_query(entity.get('title') or entity.get('name'),
+                                          entity.get('artists') or entity.get('subtitle'),
+                                          entity.get('duration'))
+                if query:
+                    return [query]
+            elif kind in ('playlist', 'album'):
+                tracks = entity.get('tracks')
+                track_list = (entity.get('trackList')
+                              or (tracks.get('items') if isinstance(tracks, dict) else tracks)
+                              or [])
+                queries = [self._track_query(t.get('title') or t.get('name'),
+                                             t.get('artists') or t.get('subtitle') or t.get('artist'),
+                                             t.get('duration'))
+                           for t in track_list if isinstance(t, dict)]
+                queries = [q for q in queries if q]
+                if queries:
+                    return queries
+        return []
+
+    def _spotify_oembed_queries(self, url):
+        """Last resort: oEmbed gives the title only, no artist and no duration."""
+        try:
+            resp = requests.get("https://open.spotify.com/oembed", params={'url': url},
+                                headers={'User-Agent': BROWSER_UA}, timeout=5)
+            if resp.status_code == 200:
+                title = resp.json().get('title')
+                if title:
+                    return [title.replace('\xa0', ' ').strip()]
+        except Exception as e:
+            print(f"oEmbed extraction error: {e}")
+        return []
+
+    # ─── YouTube search ──────────────────────────────────────────────────────
+    def _search_candidates(self, query, limit=SEARCH_CANDIDATES):
+        """One flat search request returning `limit` lightweight results."""
+        opts = dict(ydl_opts, extract_flat='in_playlist', quiet=True, skip_download=True)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+        return [e for e in (info or {}).get('entries') or [] if e]
+
+    def _score_candidate(self, entry, query, target_duration=None):
+        """Rank one search result against the track that was asked for.
+
+        Previously the first ytsearch1 hit was taken as-is, which is how covers,
+        sped-up edits and hour-long loops kept winning over the real song.
+        """
+        title = str(entry.get('title') or '')
+        lowered = title.lower()
+        channel = str(entry.get('channel') or entry.get('uploader') or '').lower()
+        query_lower = query.lower()
+
+        query_tokens = _tokens(query)
+        # Match against title *and* channel: official uploads often drop the
+        # artist from the title because the channel already carries it.
+        found = _tokens(f"{title} {channel}")
+        overlap = len(query_tokens & found) / len(query_tokens) if query_tokens else 0.0
+        score = 2.0 * overlap
+
+        # "<Artist> - Topic" is YouTube's auto-generated upload of the real release.
+        if channel.endswith('- topic'):
+            score += 0.8
+        # A channel named after the artist is usually the artist's own channel.
+        elif query_tokens & _tokens(channel):
+            score += 0.3
+        if 'official' in lowered:
+            score += 0.25
+
+        for term in JUNK_TERMS:
+            if term not in query_lower and re.search(rf'\b{re.escape(term)}\b', lowered):
+                score -= 0.6
+
+        duration = entry.get('duration') or 0
+        if target_duration and duration:
+            gap = abs(duration - target_duration)
+            if gap <= 5:
+                score += 0.8
+            elif gap <= 15:
+                score += 0.3
+            else:
+                score -= min(2.5, gap / 20.0)
+        elif duration:
+            if duration < 45:        # shorts and clips
+                score -= 0.6
+            elif duration > 900:     # 15min+ with no target length to compare against
+                score -= 0.4
+        return score
+
+    def _best_match_url(self, query, target_duration=None):
+        """Return the best-scoring result's watch URL, or None if search failed."""
+        try:
+            candidates = self._search_candidates(query)
+        except Exception as e:
+            print(f"YouTube search error for '{query}': {e}")
+            return None
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda entry: self._score_candidate(entry, query, target_duration))
+        video_id = best.get('id')
+        return best.get('url') or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
 
     def search_yt(self, item):
         item_str = str(item).strip()
-        # Intercept Spotify URLs to extract track queries and avoid yt-dlp DRM errors
-        if any(k in item_str for k in ['spotify.com', 'spotify.link', 'spotify.app.link', 'spoti.fi', 'spotify:']):
+        # Intercept Spotify URLs: yt-dlp cannot fetch Spotify audio (DRM).
+        if any(host in item_str for host in SPOTIFY_HOSTS):
             queries = self.extract_spotify_queries(item_str)
-            if queries:
-                item_str = queries[0]
-            else:
+            if not queries:
                 return False
+            item_str = queries[0]
+
+        if item_str.startswith(('http://', 'https://', 'www.')):
+            target = item_str
+        else:
+            query = item_str.replace('\xa0', ' ').strip()
+            # ytsearch1 as the last resort keeps behaviour if scoring finds nothing.
+            target = self._best_match_url(query, self._duration_hints.get(item_str)) or f"ytsearch1:{query}"
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
-                if item_str.startswith(('http://', 'https://', 'www.')):
-                    info = ydl.extract_info(item_str, download=False)
-                    if isinstance(info, dict) and 'entries' in info and info['entries']:
-                        info = info['entries'][0]
-                else:
-                    clean_item = item_str.replace('\xa0', ' ').strip()
-                    search_query = f"ytsearch1:{clean_item} official audio" if 'audio' not in clean_item.lower() else f"ytsearch1:{clean_item}"
-                    info = ydl.extract_info(search_query, download=False)
-                    if isinstance(info, dict) and 'entries' in info and info['entries']:
-                        info = info['entries'][0]
-                    if not info or not isinstance(info, dict):
-                        info = ydl.extract_info(f"ytsearch1:{clean_item}", download=False)
-                        if isinstance(info, dict) and 'entries' in info and info['entries']:
-                            info = info['entries'][0]
+                info = ydl.extract_info(target, download=False)
             except Exception as e:
                 print(f"search_yt error for '{item}': {e}")
                 return False
-            if not isinstance(info, dict):
-                return False
-            return {
-                'url': info.get('url'),
-                'title': info.get('title', 'Unknown Title'),
-                'duration': info.get('duration', 0),
-                'web_url': info.get('webpage_url', item_str)
-            }
+
+        if isinstance(info, dict) and info.get('entries'):
+            info = info['entries'][0]
+        if not isinstance(info, dict):
+            return False
+        return {
+            'url': info.get('url'),
+            'title': info.get('title', 'Unknown Title'),
+            'duration': info.get('duration', 0),
+            'web_url': info.get('webpage_url', item_str),
+        }
 
     def clean_spotify_url(self, raw_url):
         if not raw_url:
@@ -230,10 +339,9 @@ class Test(commands.Cog):
             if len(parts) >= 3:
                 return f"https://open.spotify.com/{parts[1]}/{parts[2]}"
                 
-        if any(domain in url for domain in ['spotify.link', 'spoti.fi', 'spotify.app.link']):
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        if any(domain in url for domain in ('spotify.link', 'spoti.fi', 'spotify.app.link')):
             try:
-                r = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+                r = requests.get(url, headers={'User-Agent': BROWSER_UA}, allow_redirects=True, timeout=10)
                 url = r.url
             except Exception as e:
                 print(f"Shortlink expansion error for '{url}': {e}")
@@ -291,13 +399,14 @@ class Test(commands.Cog):
         voice = discord.utils.get(self.client.voice_clients, guild=ctx.guild)
         try:
             channel = ctx.author.voice.channel
-        except:
+        except AttributeError:
             channel = None
         if arg == None:
             try:
                 voice.resume()
                 await ctx.message.add_reaction("▶")
-            except:
+            except (AttributeError, discord.ClientException) as e:
+                print(f"test_play resume error: {type(e).__name__}: {e}")
                 if voice == None or not voice.is_connected():
                     await ctx.send(embed=discord.Embed(description="No songs in the queue !", color=discord.Color.red()))
                 else:
@@ -558,7 +667,8 @@ class Test(commands.Cog):
                 embed = discord.Embed(
                     description=f'**Now Playing** [{state["nowplaying"]["name"]}]({state["nowplaying"]["url"]})', color=discord.Color.blurple())
                 await ctx.send(embed=embed)
-            except:
+            except Exception as e:
+                print(f"tjump_ error: {type(e).__name__}: {e}")
                 await ctx.send(embed=discord.Embed(description="Jump index not valid !", color=discord.Color.red()))
         else:
             await ctx.send(embed=discord.Embed(description="Jump index not given !", color=discord.Color.red()))
@@ -650,8 +760,10 @@ class Test(commands.Cog):
                         embed = await self.queue_create(vc_id, state, count)
 
                     await reaction.message.edit(embed=embed)
-            except:
-                pass
+            except AttributeError:
+                pass  # reacting user isn't in a voice channel
+            except Exception as e:
+                print(f"on_reaction_add error: {type(e).__name__}: {e}")
 
     @commands.command(aliases=['leave'])
     async def tleave_(self, ctx):
@@ -694,15 +806,8 @@ class Test(commands.Cog):
 
     # LIKED SONGS
     def _init_liked_db(self):
-        with sqlite3.connect('fav_disc.db') as conn:
-            c = conn.cursor()
-            c.execute("""CREATE TABLE IF NOT EXISTS liked (
-                user_id INTEGER,
-                song TEXT,
-                url TEXT,
-                duration TEXT
-            )""")
-            conn.commit()
+        # Schema lives in env_config.SCHEMA and is applied at startup.
+        env_config.init_db()
 
     @commands.command(aliases=['like'])
     async def tlike_(self, ctx):
@@ -713,7 +818,7 @@ class Test(commands.Cog):
             song = state['nowplaying']['name']
             url = state['nowplaying']['url']
             duration = state['nowplaying']['duration']
-            with sqlite3.connect('fav_disc.db') as conn:
+            with sqlite3.connect(env_config.DB_PATH) as conn:
                 c = conn.cursor()
                 c.execute("INSERT INTO liked (user_id, song, url, duration) VALUES (?,?,?,?)", (x, song, url, duration))
                 conn.commit()
@@ -726,7 +831,7 @@ class Test(commands.Cog):
         self._init_liked_db()
         user_id = ctx.message.author.id
         try:
-            with sqlite3.connect('fav_disc.db') as conn:
+            with sqlite3.connect(env_config.DB_PATH) as conn:
                 c = conn.cursor()
                 c.execute("SELECT song, url, duration FROM liked WHERE user_id = ?", (user_id,))
                 rows = c.fetchall()
@@ -739,6 +844,7 @@ class Test(commands.Cog):
                 songs += f"\n{i+1}. {row[0]}"
             await ctx.send(embed=discord.Embed(description=f"**Liked Songs | {ctx.author.mention}**\n{songs}", color=discord.Color.orange()))
         except Exception as e:
+            print(f"Liked songs fetch error: {type(e).__name__}: {e}")
             await ctx.send(embed=discord.Embed(description="Failed to fetch Liked Songs.", color=discord.Color.red()))
 
     @commands.command(aliases=['dislike', 'dl'])
@@ -748,7 +854,7 @@ class Test(commands.Cog):
         if num is not None:
             try:
                 num = int(num)
-                with sqlite3.connect('fav_disc.db') as conn:
+                with sqlite3.connect(env_config.DB_PATH) as conn:
                     c = conn.cursor()
                     c.execute("SELECT song FROM liked WHERE user_id = ?", (user_id,))
                     rows = c.fetchall()
@@ -767,7 +873,7 @@ class Test(commands.Cog):
     async def play_liked_(self, ctx, num=None):
         self._init_liked_db()
         user_id = ctx.message.author.id
-        with sqlite3.connect('fav_disc.db') as conn:
+        with sqlite3.connect(env_config.DB_PATH) as conn:
             c = conn.cursor()
             c.execute("SELECT song, url, duration FROM liked WHERE user_id = ?", (user_id,))
             rows = c.fetchall()
@@ -818,8 +924,14 @@ class Test(commands.Cog):
 
     @commands.command(aliases=['spotifyp', 'spp'])
     async def spotify_playlist_search(self, ctx, *, arg):
+        client_id = env_config.get('SPOTIFY_CLIENT_ID')
+        client_secret = env_config.get('SPOTIFY_CLIENT_SECRET')
+        if not (client_id and client_secret):
+            return await ctx.send(embed=discord.Embed(
+                description="Spotify search needs `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` in `.env`.",
+                color=discord.Color.red()))
         spotify = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(
-            client_id=os.getenv('SPOTIFY_CLIENT_ID'), client_secret=os.getenv('SPOTIFY_CLIENT_SECRET')))
+            client_id=client_id, client_secret=client_secret))
         msg = await ctx.send(embed=discord.Embed(description=f"**Searching** - {arg} on Spotify", color=discord.Color.gold()))
         var = arg
         arg = arg.split(" ")
@@ -828,13 +940,14 @@ class Test(commands.Cog):
             q = f"{q}{arg[i]}%"
         q = q[1:-1]
         try:
-            search = spotify.search(
-                q, limit=1, offset=0, type='playlist', market='IN')
+            search = await asyncio.to_thread(
+                spotify.search, q, limit=1, offset=0, type='playlist', market='IN')
             url = search['playlists']['items'][0]['external_urls']['spotify']
             await ctx.send(url)
             await msg.delete()
             await self.test_play(ctx, url)
-        except:
+        except Exception as e:
+            print(f"spotify_playlist_search error for '{var}': {type(e).__name__}: {e}")
             await msg.edit(embed=discord.Embed(description=f"Failed to get playlist named `{var}`", color=discord.Color.orange()))
 
 async def setup(client):

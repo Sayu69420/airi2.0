@@ -1,9 +1,8 @@
 import discord
-from discord import embeds
-from discord.ext import commands
 import asyncio
-import sqlite3
-import os
+from discord.ext import commands
+
+import env_config
 
 class Mod(commands.Cog):
     def __init__(self,client):
@@ -108,12 +107,13 @@ class Mod(commands.Cog):
     async def join_(self,ctx,member:discord.Member=None):
         try:
             channel = ctx.author.voice.channel.id
-            if member!=None:
-                msg = await ctx.send(f'{member.mention}')
+            if member != None:
+                await ctx.send(f'{member.mention}')
             else:
-                msg = await ctx.send(f'{ctx.message.guild.default_role}')
+                await ctx.send(f'{ctx.message.guild.default_role}')
             await ctx.send(embed=discord.Embed(description=f"📢 Join <#{channel}>",color=discord.Color.orange()))
-        except:
+        except AttributeError as e:
+            print(f"join_ error: {type(e).__name__}: {e}")
             await ctx.send(embed=discord.Embed(description="You are not connected to any VoiceChannel",color=discord.Color.red()))
         # embed = discord.Embed(description="use `join vc <@person>` or `join tc <@person>`")
 
@@ -124,8 +124,8 @@ class Mod(commands.Cog):
 
     @commands.command(aliases=['bug','report'])
     async def bug_report(self,ctx,*,arg):
-        raw_id = os.getenv('BUG_REPORT_CHANNEL_ID')
-        bug_channel = self.client.get_channel(int(raw_id)) if raw_id and raw_id.isdigit() else None
+        channel_id = env_config.get_id('BUG_REPORT_CHANNEL_ID')
+        bug_channel = self.client.get_channel(channel_id) if channel_id else None
         if not bug_channel:
             return await ctx.send(embed=discord.Embed(description="Bug report channel is not configured correctly.", color=discord.Color.red()))
         try:

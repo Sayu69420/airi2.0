@@ -1,7 +1,7 @@
-import discord,sqlite3,asyncio,json,random,requests,praw,os
-from discord import embeds
-from discord.errors import DiscordServerError
+import discord, asyncio, random, requests
 from discord.ext import commands
+
+import env_config
 
 queue1 = []
 
@@ -12,17 +12,21 @@ class Task(commands.Cog):
 
     @commands.command(aliases=['hi','hii','hello'])
     async def _hey(self,ctx):
-        resp = str("Hello !")
-        msg = await ctx.reply(resp)
+        await ctx.reply("Hello !")
         await ctx.message.add_reaction("🧡")
 
     @commands.command(aliases=['anime'])
     async def anime_(self, ctx, *, arg):
         try:
             headers = {'User-Agent': 'AiriBot/1.0'}
-            response = requests.get(f'https://api.jikan.moe/v4/anime?q={arg}&limit=1', headers=headers, timeout=10)
-            res_json = response.json()
-            if response.status_code != 200 or 'data' not in res_json or not res_json['data']:
+            response = await asyncio.to_thread(
+                requests.get, 'https://api.jikan.moe/v4/anime',
+                params={'q': arg, 'limit': 1}, headers=headers, timeout=10)
+            res_json = response.json() if response.status_code == 200 else {}
+            if response.status_code == 429:
+                return await ctx.send(embed=discord.Embed(description="Jikan rate limit hit (3 req/sec). Try again in a moment!", color=discord.Color.orange()))
+            if response.status_code != 200 or not res_json.get('data'):
+                print(f"Jikan anime lookup failed: HTTP {response.status_code} for {arg!r}")
                 return await ctx.send(embed=discord.Embed(description="Anime not found or API unavailable!", color=discord.Color.red()))
 
             anime_dict = res_json['data'][0]
@@ -52,15 +56,21 @@ class Task(commands.Cog):
 
             await ctx.send(embed=embed)
         except Exception as e:
+            print(f"Anime lookup error: {type(e).__name__}: {e}")
             await ctx.send(embed=discord.Embed(description="Failed to get anime info. Try again later!", color=discord.Color.red()))
 
     @commands.command(aliases=['manga'])
     async def manga_(self, ctx, *, arg):
         try:
             headers = {'User-Agent': 'AiriBot/1.0'}
-            response = requests.get(f'https://api.jikan.moe/v4/manga?q={arg}&limit=1', headers=headers, timeout=10)
-            res_json = response.json()
-            if response.status_code != 200 or 'data' not in res_json or not res_json['data']:
+            response = await asyncio.to_thread(
+                requests.get, 'https://api.jikan.moe/v4/manga',
+                params={'q': arg, 'limit': 1}, headers=headers, timeout=10)
+            res_json = response.json() if response.status_code == 200 else {}
+            if response.status_code == 429:
+                return await ctx.send(embed=discord.Embed(description="Jikan rate limit hit (3 req/sec). Try again in a moment!", color=discord.Color.orange()))
+            if response.status_code != 200 or not res_json.get('data'):
+                print(f"Jikan manga lookup failed: HTTP {response.status_code} for {arg!r}")
                 return await ctx.send(embed=discord.Embed(description="Manga not found or API unavailable!", color=discord.Color.red()))
 
             manga_dict = res_json['data'][0]
@@ -90,6 +100,7 @@ class Task(commands.Cog):
 
             await ctx.send(embed=embed)
         except Exception as e:
+            print(f"Manga lookup error: {type(e).__name__}: {e}")
             await ctx.send(embed=discord.Embed(description="Failed to get manga info. Try again later!", color=discord.Color.red()))
 
     @commands.command(aliases=['pic'])
@@ -130,26 +141,26 @@ class Task(commands.Cog):
         text = str(text).lower()
         try:
             await ctx.message.delete()
-        except:
-            pass
+        except discord.HTTPException as e:
+            print(f"_replied delete error: {type(e).__name__}: {e}")
         for y in text:
             emoji = emoji_list.get(y)
             if emoji:
                 try:
                     await msg.add_reaction(emoji)
-                except:
-                    pass
+                except discord.HTTPException as e:
+                    print(f"_replied add_reaction error: {type(e).__name__}: {e}")
         # except:
             # await ctx.send(embed = discord.Embed(description="Referenced message not found !!",color=discord.Color.red()))
 
     @commands.command(aliases=['wall', 'wallpaper'])
     async def wallp_(self, ctx, *, query: str = None):
-        client_id = os.getenv('UNSPLASH_CLIENT_ID', '').strip()
+        client_id = env_config.get('UNSPLASH_CLIENT_ID')
         page = random.randint(1, 5)
         headers = {'User-Agent': 'AiriBot/1.0'}
 
         # 1. Try Unsplash if valid client_id is set
-        if client_id and client_id != 'CLIENT_ID':
+        if client_id:
             try:
                 if query is None:
                     url = f'https://api.unsplash.com/topics/wallpapers/photos?client_id={client_id}&page={page}'

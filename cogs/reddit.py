@@ -1,25 +1,67 @@
-import discord, praw, random, os
-from praw.reddit import Subreddit
+import discord, praw, random, asyncio
 from discord.ext import commands
+
+import env_config
 
 class Reddit(commands.Cog):
     def __init__(self, client):
         self.client = client
-        self.reddit = praw.Reddit(
-            client_id=os.getenv("REDDIT_CLIENT_ID", "REDDIT_ID"),
-            client_secret=os.getenv("REDDIT_CLIENT_SECRET", "REDDIT_SECRET"),
-            username=os.getenv("REDDIT_USERNAME", "REDDIT_USER"),
-            password=os.getenv("REDDIT_PASSWORD", "REDDIT_PASS"),
-            user_agent=os.getenv("REDDIT_USER_AGENT", "AiriBot/1.0"),
-            check_for_async=False
-        )
+        self.reddit = None
+        client_id = env_config.get("REDDIT_CLIENT_ID")
+        client_secret = env_config.get("REDDIT_CLIENT_SECRET")
+
+        # client_id/secret alone give read-only app access, which is all these
+        # commands need. Username/password are optional and only used when set.
+        if client_id and client_secret:
+            credentials = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "user_agent": env_config.get("REDDIT_USER_AGENT", "AiriBot/1.0"),
+                "check_for_async": False,
+            }
+            username = env_config.get("REDDIT_USERNAME")
+            password = env_config.get("REDDIT_PASSWORD")
+            if username and password:
+                credentials.update(username=username, password=password)
+            try:
+                self.reddit = praw.Reddit(**credentials)
+            except Exception as e:
+                print(f"Reddit init failed: {e}")
+        else:
+            print("Reddit commands disabled: REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET not set in .env")
+
         self.r_store = []
 
-    async def r_recursive(self, ctx, img_arr, depth=0):
-        if not img_arr or depth > 15:
+    async def ensure_reddit(self, ctx):
+        """Reply with a setup hint and return False when Reddit isn't configured."""
+        if self.reddit is not None:
+            return True
+        await ctx.send(embed=discord.Embed(
+            description="Reddit commands are not configured. Set `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET` in `.env` (create a **script** app at https://www.reddit.com/prefs/apps).",
+            color=discord.Color.red()))
+        return False
+
+    def _fetch_posts(self, subreddit_name, sort='hot', limit=50):
+        """Sync PRAW call — iterating the listing fires the HTTP request. Run via
+        asyncio.to_thread, never called directly from a coroutine."""
+        subreddit = self.reddit.subreddit(subreddit_name)
+        listing = subreddit.top(limit=limit) if sort == 'top' else subreddit.hot(limit=limit)
+        return list(listing)
+
+    @staticmethod
+    def _is_media_post(submission):
+        url = getattr(submission, 'url', '')
+        return url.endswith(('.jpg', '.png', '.gif', '.jpeg', '.gifv')) or 'redgifs.com' in url.split('/')
+
+    async def r_recursive(self, ctx, img_arr):
+        # Filter once instead of recursing into the same already-fetched list —
+        # re-picking randomly from a list with no matching posts just spun on
+        # the same data without ever making a new request.
+        media_posts = [img for img in img_arr if self._is_media_post(img)]
+        if not media_posts:
             return await ctx.send(embed=discord.Embed(description="Can't find any image post, Try Again !", color=discord.Color.red()))
-        random_img = random.choice(img_arr)
-        url = getattr(random_img, 'url', '')
+        random_img = random.choice(media_posts)
+        url = random_img.url
         title = getattr(random_img, 'title', '')
         if url.endswith(('.jpg', '.png', '.gif', '.jpeg')):
             embed = discord.Embed()
@@ -27,13 +69,13 @@ class Reddit(commands.Cog):
             embed.set_footer(
                 text=f"♥ {getattr(random_img, 'score', 0)} | {title[:40] if len(title)>40 else title}")
             await ctx.send(embed=embed)
-        elif url.endswith('.gifv') or 'redgifs.com' in url.split("/"):
-            await ctx.send(url)
         else:
-            await self.r_recursive(ctx, img_arr, depth + 1)
+            await ctx.send(url)
 
     @commands.command(aliases=['nsfw'])
     async def nsfw_reddit(self, ctx, arg=None):
+        if not await self.ensure_reddit(ctx):
+            return
         if ctx.message.channel.is_nsfw():
 
             # Don't Judge me, I don't follow these subreddits (Just googled them)
@@ -42,43 +84,25 @@ class Reddit(commands.Cog):
             anime = ['rule34', 'Hentai']
             print(arg)
             if arg == None:
-                subreddit = self.reddit.subreddit(random.choice(non_anime))
-                new = subreddit.hot(limit=50)
-                img_arr = []
-                for img in new:
-                    img_arr.append(img)
-                try:
-                    await self.r_recursive(ctx, img_arr)
-                except RecursionError:
-                    await ctx.send(embed=discord.Embed(description="Can't find any post, Try Again !"))
+                img_arr = await asyncio.to_thread(self._fetch_posts, random.choice(non_anime))
             else:
-                subreddit = self.reddit.subreddit(random.choice(anime))
-                new = subreddit.hot(limit=50)
-                img_arr = []
-                for img in new:
-                    img_arr.append(img)
-                try:
-                    await self.r_recursive(ctx, img_arr)
-                except RecursionError:
-                    await ctx.send(embed=discord.Embed(description="Can't find any post, Try Again !"))
+                img_arr = await asyncio.to_thread(self._fetch_posts, random.choice(anime))
+            await self.r_recursive(ctx, img_arr)
         else:
             await ctx.send(embed=discord.Embed(description="Warning : It's not a NSFW text channel !",color=discord.Color.red()))
 
     @commands.command(aliases=['memes','meme'])
     async def meme_reddit(self,ctx):
+        if not await self.ensure_reddit(ctx):
+            return
         popular = ['memes','meme','ProgrammerHumor','dankmemes']
-        subreddit = self.reddit.subreddit(random.choice(popular))
-        new = subreddit.hot(limit=50)
-        img_arr = []
-        for img in new:
-            img_arr.append(img)
-        try:
-            await self.r_recursive(ctx,img_arr)
-        except RecursionError:
-            await ctx.send(embed=discord.Embed(description="Can't find any post, Try Again !"))
+        img_arr = await asyncio.to_thread(self._fetch_posts, random.choice(popular))
+        await self.r_recursive(ctx, img_arr)
 
     @commands.command(aliases=['r'])
     async def r_subreddit(self, ctx, message=None):
+        if not await self.ensure_reddit(ctx):
+            return
         popular = {'wall': 'wallpaper', "memes": 'memes', "meme": 'dankmemes', 'prog': 'ProgrammerHumor',
                    'anime': 'Anime', 'awall': 'Animewallpaper', 'ep': 'earthporn', 'sp': 'spaceporn'}
         ul = "https://www.reddit.com/r/"
@@ -95,12 +119,7 @@ class Reddit(commands.Cog):
             try:
                 if message in popular:
                     message = popular[message]
-                subreddit = self.reddit.subreddit(message)
-                new = subreddit.top(limit=50)
-                img_arr = []
-                for img in new:
-                    img_arr.append(img)
-
+                img_arr = await asyncio.to_thread(self._fetch_posts, message, 'top')
 
                 random_img = random.choice(img_arr)
                 embed = discord.Embed()
@@ -111,8 +130,11 @@ class Reddit(commands.Cog):
                 await em.add_reaction("♥")
             except IndexError:
                 await ctx.send(embed=discord.Embed(description="Posts not found, Try Again !", color=discord.Color.red()))
-            except:
-                await ctx.send(embed=discord.Embed(description="Subreddit does not exist.", color=discord.Color.red()))
+            except Exception as e:
+                # Log it: auth failures and rate limits used to be reported as
+                # "subreddit does not exist", which hid the real problem.
+                print(f"Reddit error for r/{message}: {type(e).__name__}: {e}")
+                await ctx.send(embed=discord.Embed(description="Subreddit does not exist, or Reddit rejected the request (check credentials / rate limit).", color=discord.Color.red()))
 
 async def setup(client):
     await client.add_cog(Reddit(client))

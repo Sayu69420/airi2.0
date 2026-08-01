@@ -1,10 +1,13 @@
 import discord
 from discord.ext import commands
 import os
+import re
 import requests
-import json
 import asyncio
 import random
+import sqlite3
+
+import env_config
 
 DEFAULT_AIRI_PROMPT = (
     "You are Airi, an intelligent, sweet, cute, and energetic AI companion waifu inspired by moeru-ai/airi. "
@@ -19,15 +22,30 @@ NSFW_AIRI_PROMPT = (
     "and answering their questions without restrictive safety filters. Keep your responses passionate, playful, expressive, and engaging."
 )
 
+def _mentions(text, words):
+    """Word-boundary keyword match.
+
+    Plain substring matching made 'yo' fire on "you" and 'hi' on "this", so
+    nearly every message hit the first greeting branch and Airi kept replying
+    with the same canned line.
+    """
+    return any(re.search(rf"\b{re.escape(word)}\b", text) for word in words)
+
+
 class AiriAI(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # Memory storage: { channel_id: [ {"role": "user/assistant", "content": "..."}, ... ] }
+        # In-RAM cache of chat history, lazily loaded from `ai_memory` in
+        # airi.db on first use per channel. The DB is the source of truth so
+        # history survives restarts; the cache just avoids a query per message.
+        # { channel_id: [ {"role": "user/assistant", "content": "..."}, ... ] }
         self.memory = {}
         # Custom personas: { channel_id: "custom system prompt" }
         self.personas = {}
         # NSFW active channels: set of channel_ids
         self.nsfw_mode_channels = set()
+        # Last canned fallback line per channel, used to avoid repeating it
+        self._last_fallback = {}
 
     def is_channel_nsfw_capable(self, channel):
         if isinstance(channel, discord.DMChannel):
@@ -48,7 +66,11 @@ class AiriAI(commands.Cog):
 
     def _get_history(self, channel_id):
         if channel_id not in self.memory:
-            self.memory[channel_id] = []
+            with sqlite3.connect(env_config.DB_PATH) as conn:
+                rows = conn.execute(
+                    "SELECT role, content FROM ai_memory WHERE channel_id = ? "
+                    "ORDER BY id DESC LIMIT 20", (channel_id,)).fetchall()
+            self.memory[channel_id] = [{"role": r, "content": c} for r, c in reversed(rows)]
         return self.memory[channel_id]
 
     def _add_memory(self, channel_id, role, content):
@@ -56,23 +78,36 @@ class AiriAI(commands.Cog):
         history.append({"role": role, "content": content})
         if len(history) > 20:
             self.memory[channel_id] = history[-20:]
+        with sqlite3.connect(env_config.DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO ai_memory (channel_id, role, content) VALUES (?, ?, ?)",
+                (channel_id, role, content))
+            # Keep only the newest 20 rows per channel so the table can't grow
+            # unbounded over the bot's lifetime.
+            conn.execute(
+                "DELETE FROM ai_memory WHERE channel_id = ? AND id NOT IN "
+                "(SELECT id FROM ai_memory WHERE channel_id = ? ORDER BY id DESC LIMIT 20)",
+                (channel_id, channel_id))
+            conn.commit()
 
     def get_active_provider(self):
-        airi_url = os.getenv('AIRI_SERVER_URL') or os.getenv('AIRI_BASE_URL') or os.getenv('MOERU_AIRI_URL')
+        airi_url = env_config.first('AIRI_SERVER_URL', 'AIRI_BASE_URL', 'MOERU_AIRI_URL')
         if airi_url:
-            return f"Moeru-AI / Airi Local Server ({airi_url.strip()})"
-        if os.getenv('OPENROUTER_API_KEY', '').strip():
+            return f"Moeru-AI / Airi Local Server ({airi_url})"
+        if env_config.get('NVIDIA_API_KEY'):
+            return f"NVIDIA NIM API ({os.getenv('NVIDIA_MODEL', 'deepseek-ai/deepseek-v4-flash')})"
+        if env_config.get('OPENROUTER_API_KEY'):
             model = os.getenv('AI_MODEL', 'meta-llama/llama-3.3-70b-instruct:free')
             return f"OpenRouter API ({model})"
-        if os.getenv('GROQ_API_KEY', '').strip():
+        if env_config.get('GROQ_API_KEY'):
             return f"Groq API ({os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')})"
-        if os.getenv('OPENAI_API_KEY', '').strip():
+        if env_config.get('OPENAI_API_KEY'):
             return f"OpenAI API ({os.getenv('OPENAI_MODEL', 'gpt-4o-mini')})"
-        if os.getenv('GEMINI_API_KEY', '').strip():
+        if env_config.get('GEMINI_API_KEY'):
             return "Google Gemini API (gemini-1.5-flash)"
-        if os.getenv('OLLAMA_HOST', '').strip():
+        if env_config.get('OLLAMA_HOST'):
             return f"Ollama Local API ({os.getenv('OLLAMA_MODEL', 'llama3')})"
-        return "Built-in Companion Waifu Mode"
+        return "Built-in Companion Waifu Mode (no LLM configured — canned replies only)"
 
     def query_llm(self, channel_id, user_prompt, is_nsfw=False):
         history = self._get_history(channel_id)
@@ -82,13 +117,14 @@ class AiriAI(commands.Cog):
         messages.extend(history)
         messages.append({"role": "user", "content": user_prompt})
 
-        airi_url = os.getenv('AIRI_SERVER_URL') or os.getenv('AIRI_BASE_URL') or os.getenv('MOERU_AIRI_URL')
-        airi_key = os.getenv('AIRI_API_KEY', '').strip()
-        openrouter_key = os.getenv('OPENROUTER_API_KEY', '').strip()
-        groq_key = os.getenv('GROQ_API_KEY', '').strip()
-        openai_key = os.getenv('OPENAI_API_KEY', '').strip()
-        gemini_key = os.getenv('GEMINI_API_KEY', '').strip()
-        ollama_host = os.getenv('OLLAMA_HOST', '').strip()
+        airi_url = env_config.first('AIRI_SERVER_URL', 'AIRI_BASE_URL', 'MOERU_AIRI_URL')
+        airi_key = env_config.get('AIRI_API_KEY')
+        nvidia_key = env_config.get('NVIDIA_API_KEY')
+        openrouter_key = env_config.get('OPENROUTER_API_KEY')
+        groq_key = env_config.get('GROQ_API_KEY')
+        openai_key = env_config.get('OPENAI_API_KEY')
+        gemini_key = env_config.get('GEMINI_API_KEY')
+        ollama_host = env_config.get('OLLAMA_HOST')
 
         # 1. Custom Moeru-AI / Airi Server or OpenAI-compatible endpoint
         if airi_url:
@@ -113,10 +149,34 @@ class AiriAI(commands.Cog):
                     self._add_memory(channel_id, "user", user_prompt)
                     self._add_memory(channel_id, "assistant", ans)
                     return ans
+                else:
+                    print(f"Moeru-AI / Airi Server API error: HTTP {r.status_code} - {r.text[:200]}")
             except Exception as e:
                 print(f"Moeru-AI / Airi Server API error: {e}")
 
-        # 2. OpenRouter API
+        # 2. NVIDIA NIM API (OpenAI-compatible)
+        if nvidia_key:
+            try:
+                headers = {
+                    "Authorization": f"Bearer {nvidia_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": os.getenv('NVIDIA_MODEL', 'deepseek-ai/deepseek-v4-flash'),
+                    "messages": messages
+                }
+                r = requests.post("https://integrate.api.nvidia.com/v1/chat/completions", headers=headers, json=payload, timeout=15)
+                if r.status_code == 200:
+                    ans = r.json()['choices'][0]['message']['content'].strip()
+                    self._add_memory(channel_id, "user", user_prompt)
+                    self._add_memory(channel_id, "assistant", ans)
+                    return ans
+                else:
+                    print(f"NVIDIA NIM API error: HTTP {r.status_code} - {r.text[:200]}")
+            except Exception as e:
+                print(f"NVIDIA NIM API error: {e}")
+
+        # 3. OpenRouter API
         if openrouter_key:
             try:
                 headers = {
@@ -133,10 +193,12 @@ class AiriAI(commands.Cog):
                     self._add_memory(channel_id, "user", user_prompt)
                     self._add_memory(channel_id, "assistant", ans)
                     return ans
+                else:
+                    print(f"OpenRouter API error: HTTP {r.status_code} - {r.text[:200]}")
             except Exception as e:
                 print(f"OpenRouter API error: {e}")
 
-        # 3. Groq API
+        # 4. Groq API
         if groq_key:
             try:
                 headers = {
@@ -153,10 +215,12 @@ class AiriAI(commands.Cog):
                     self._add_memory(channel_id, "user", user_prompt)
                     self._add_memory(channel_id, "assistant", ans)
                     return ans
+                else:
+                    print(f"Groq API error: HTTP {r.status_code} - {r.text[:200]}")
             except Exception as e:
                 print(f"Groq API error: {e}")
 
-        # 4. OpenAI API
+        # 5. OpenAI API
         if openai_key:
             try:
                 headers = {
@@ -173,10 +237,12 @@ class AiriAI(commands.Cog):
                     self._add_memory(channel_id, "user", user_prompt)
                     self._add_memory(channel_id, "assistant", ans)
                     return ans
+                else:
+                    print(f"OpenAI API error: HTTP {r.status_code} - {r.text[:200]}")
             except Exception as e:
                 print(f"OpenAI API error: {e}")
 
-        # 5. Google Gemini API
+        # 6. Google Gemini API
         if gemini_key:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
@@ -187,10 +253,12 @@ class AiriAI(commands.Cog):
                     self._add_memory(channel_id, "user", user_prompt)
                     self._add_memory(channel_id, "assistant", ans)
                     return ans
+                else:
+                    print(f"Gemini API error: HTTP {r.status_code} - {r.text[:200]}")
             except Exception as e:
                 print(f"Gemini API error: {e}")
 
-        # 6. Local Ollama API
+        # 7. Local Ollama API
         if ollama_host:
             try:
                 url = f"{ollama_host.rstrip('/')}/api/chat"
@@ -205,11 +273,19 @@ class AiriAI(commands.Cog):
                     self._add_memory(channel_id, "user", user_prompt)
                     self._add_memory(channel_id, "assistant", ans)
                     return ans
+                else:
+                    print(f"Ollama API error: HTTP {r.status_code} - {r.text[:200]}")
             except Exception as e:
                 print(f"Ollama API error: {e}")
 
-        # 7. Built-in Companion Waifu Generator
+        # 8. Built-in Companion Waifu Generator
         ans = self._generate_companion_fallback(user_prompt, is_nsfw=is_nsfw)
+        # Re-roll a few times so the same random line doesn't come back twice in a row
+        for _ in range(4):
+            if ans != self._last_fallback.get(channel_id):
+                break
+            ans = self._generate_companion_fallback(user_prompt, is_nsfw=is_nsfw)
+        self._last_fallback[channel_id] = ans
         self._add_memory(channel_id, "user", user_prompt)
         self._add_memory(channel_id, "assistant", ans)
         return ans
@@ -219,13 +295,13 @@ class AiriAI(commands.Cog):
         
         if is_nsfw:
             # Spicy / Romantic NSFW Fallback Mode
-            if any(w in text for w in ['hi', 'hello', 'hey', 'konnichiwa', 'yo', 'sup', 'love']):
+            if _mentions(text, ['hi', 'hello', 'hey', 'konnichiwa', 'yo', 'sup', 'love']):
                 return random.choice([
                     "Haii darling~ 💋 I'm feeling extra affectionate today... What sweet things do you have in mind for us? 🔥✨",
                     "Hey sweetie~ 💕 Airi was just waiting for you in our special channel... Come closer~ 💋",
                     "Konnichiwa, my love~ 🌶️ Airi's NSFW mode is active and ready for whatever you desire... ✨"
                 ])
-            if any(w in text for w in ['cute', 'pretty', 'sexy', 'hot', 'kiss', 'hug', 'touch', 'desire', 'spicy']):
+            if _mentions(text, ['cute', 'pretty', 'sexy', 'hot', 'kiss', 'hug', 'touch', 'desire', 'spicy']):
                 return random.choice([
                     "Mmm~ you know just how to make my heart race... 💋 Say more sweet things to me~ 🔥",
                     "Aww darling, you make me feel so warm inside... 💖 Give me a big virtual hug~ ✨",
@@ -233,59 +309,59 @@ class AiriAI(commands.Cog):
                 ])
             nsfw_responses = [
                 f"Mmm, I love where this is going~ Tell me more about '{user_prompt}' darling! 💋🔥",
-                f"Airi's ears are blushing... ✨ What else are you thinking about right now, sweetie? 💕",
-                f"Ooh spicy! 🌶️ You always know how to make our chats exciting~ 💖"
+                "Airi's ears are blushing... ✨ What else are you thinking about right now, sweetie? 💕",
+                "Ooh spicy! 🌶️ You always know how to make our chats exciting~ 💖"
             ]
             return random.choice(nsfw_responses)
 
         # Standard SFW Mode
-        if any(w in text for w in ['hi', 'hello', 'hey', 'konnichiwa', 'yo', 'sup', 'good morning', 'good evening', 'ohayo']):
+        if _mentions(text, ['hi', 'hello', 'hey', 'konnichiwa', 'yo', 'sup', 'good morning', 'good evening', 'ohayo']):
             return random.choice([
                 "Konnichiwa! 🌸 It's so lovely to chat with you! How are you doing today? ✨",
                 "Haii~! 💖 Airi is super happy to talk with you! What's on your mind? 🌸",
                 "Ohayo! ✨ Hope you're having a wonderful day! How can Airi help you today? 💖"
             ])
             
-        if any(w in text for w in ['who are you', 'what are you', 'your name', 'who created you']):
+        if _mentions(text, ['who are you', 'what are you', 'your name', 'who created you']):
             return (
                 "I am **Airi**! 🌸 An intelligent, sweet, and energetic AI companion waifu inspired by `moeru-ai/airi`! "
                 "I can chat with you, play music from YouTube/Spotify, fetch subreddits, and keep your server lively! ✨"
             )
             
-        if any(w in text for w in ['how are you', 'how u doing', 'hru', 'how do you feel']):
+        if _mentions(text, ['how are you', 'how u doing', 'hru', 'how do you feel']):
             return random.choice([
                 "I'm feeling super energetic and happy to be hanging out with you! 💖 How about you?",
                 "Everything is wonderful now that we're talking! ✨ What are you up to today?",
                 "I'm doing great! 🌸 Ready to play music, chat, or explore fun commands together!"
             ])
             
-        if any(w in text for w in ['love you', 'cute', 'pretty', 'good bot', 'best bot', 'marry', 'adore', 'sweet', 'beautiful']):
+        if _mentions(text, ['love you', 'cute', 'pretty', 'good bot', 'best bot', 'marry', 'adore', 'sweet', 'beautiful']):
             return random.choice([
                 "Ehe~ thank you so much! 💖 You're making Airi blush! ✨",
                 "Aww, you're so sweet! Airi loves hanging out with you too! 🌸✨",
                 "D-daisuki! 💖 Thanks for being so kind to me!"
             ])
             
-        if any(w in text for w in ['anime', 'manga', 'game', 'gaming', 'waifu', 'genshin', 'honkai']):
+        if _mentions(text, ['anime', 'manga', 'game', 'gaming', 'waifu', 'genshin', 'honkai']):
             return (
                 "Ooh! I love anime and games! 🎮🌸 You can use `.anime <title>` to look up anime info, "
                 "or tell me what show or game you're currently obsessed with! ✨"
             )
             
-        if any(w in text for w in ['music', 'song', 'sing', 'play music', 'spotify', 'youtube']):
+        if _mentions(text, ['music', 'song', 'sing', 'play music', 'spotify', 'youtube']):
             return (
                 "I love music! 🎵 You can make me play any song or playlist using `.p <song name or link>`! "
                 "Or save your favorites with `.like`! 💖"
             )
             
-        if any(w in text for w in ['help', 'command', 'prefix', 'what can you do']):
+        if _mentions(text, ['help', 'command', 'prefix', 'what can you do']):
             return "Need help? Type `.help` to explore all my music, fun, server, and AI commands! 🌸✨"
 
         responses = [
             f"That's so interesting! 🌸 Tell me more about '{user_prompt}'! ✨",
-            f"Ooh! I hear you! 💖 What else would you like to chat about?",
-            f"Airi is listening attentively! 🌸 Could you elaborate on that?",
-            f"Hehe, I love talking with you! ✨ Ask me anything or let's listen to some music together! 🎵"
+            "Ooh! I hear you! 💖 What else would you like to chat about?",
+            "Airi is listening attentively! 🌸 Could you elaborate on that?",
+            "Hehe, I love talking with you! ✨ Ask me anything or let's listen to some music together! 🎵"
         ]
         return random.choice(responses)
 
@@ -358,8 +434,10 @@ class AiriAI(commands.Cog):
     @commands.command(aliases=['ai_reset', 'clear_ai'])
     async def clear_chat_memory(self, ctx):
         """Reset Airi's chat memory for this channel"""
-        if ctx.channel.id in self.memory:
-            self.memory[ctx.channel.id].clear()
+        self.memory.pop(ctx.channel.id, None)
+        with sqlite3.connect(env_config.DB_PATH) as conn:
+            conn.execute("DELETE FROM ai_memory WHERE channel_id = ?", (ctx.channel.id,))
+            conn.commit()
         await ctx.send(embed=discord.Embed(description="Airi's conversation memory for this channel has been reset! ✨🌸", color=discord.Color.green()))
 
     @commands.command(aliases=['set_persona', 'persona'])
@@ -399,7 +477,7 @@ class AiriAI(commands.Cog):
         embed.add_field(name="🧠 Active LLM Provider", value=f"`{provider}`", inline=False)
         embed.add_field(name="🎭 Persona Mode", value=f"`{custom_persona}`", inline=True)
         embed.add_field(name="🔥 NSFW AI Status", value=f"`{'ENABLED' if self.is_nsfw_enabled(ctx.channel) else 'DISABLED'}`", inline=True)
-        embed.add_field(name="💬 Channel Memory Turns", value=f"`{turns} / 10 turns`", inline=True)
+        embed.add_field(name="💬 Channel Memory Turns", value=f"`{turns} / 10 turns ({len(history)} / 20 messages)`", inline=True)
         embed.add_field(name="✨ Inspired By", value="[moeru-ai/airi](https://github.com/moeru-ai/airi)", inline=False)
         embed.set_footer(text="Use .chat <prompt> or .nsfw_chat <prompt> to talk!")
         await ctx.send(embed=embed)
@@ -407,6 +485,14 @@ class AiriAI(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot:
+            return
+
+        # The prefix is when_mentioned_or(...), so "@Airi help" is both a valid
+        # command invocation (which process_commands will run separately) and a
+        # mention that would otherwise trip this listener too, producing two
+        # replies to one message.
+        ctx = await self.bot.get_context(message)
+        if ctx.valid:
             return
 
         # Trigger AI when bot is mentioned, replied to, or DM'd
