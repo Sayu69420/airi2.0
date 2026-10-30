@@ -40,7 +40,12 @@ async def on_ready():
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=".help"))
     bot_server = get_personal_channel()
     if bot_server:
-        await bot_server.send(embed=discord.Embed(description=f"Airi is online\n> {datetime.datetime.now()}"))
+        try:
+            await bot_server.send(embed=discord.Embed(description=f"Airi is online\n> {datetime.datetime.now()}"))
+        except discord.Forbidden:
+            print(f"[Warning] Airi lacks 'Send Messages' or 'Embed Links' permission in personal channel {bot_server.id} ({getattr(bot_server, 'name', 'unknown')}).")
+        except Exception as e:
+            print(f"[Warning] Failed to send startup message: {e}")
 
 @client.event
 async def on_guild_join(guild):
@@ -56,7 +61,12 @@ async def on_guild_join(guild):
     embed.add_field(name='Member Count', value=guild.member_count, inline=True)
     embed.add_field(name='Created At', value=guild.created_at, inline=True)
 
-    await bot_server.send(embed=embed)
+    try:
+        await bot_server.send(embed=embed)
+    except discord.Forbidden:
+        print(f"[Warning] Airi lacks permission to send guild join embed in personal channel {bot_server.id}.")
+    except Exception as e:
+        print(f"[Warning] Failed to send guild join embed: {e}")
 
 # ERROR HANDLING
 @client.event
@@ -108,9 +118,17 @@ async def show_all_commands(ctx):
     )
 
     embed.add_field(
-        name="🌸 | Airi AI Companion Commands (moeru-ai/airi)",
+        name="🌸 | Airi AI Companion & AI Horde Commands (moeru-ai/airi)",
         value=(
             "`.chat <prompt>` / `.ask` / `.airi` / `.ai` - Chat with Airi AI companion\n"
+            "`.gemini <prompt>` / `.g` - Chat directly with Google Gemini\n"
+            "`.nvidia <prompt>` / `.nim` - Chat directly with NVIDIA NIM\n"
+            "`.horde <prompt>` / `.aihorde` - Chat directly with AI Horde crowdsourced LLM\n"
+            "`.imagine <prompt>` / `.draw` - Generate AI art via AI Horde Stable Diffusion\n"
+            "`.kudos` - View AI Horde user status, Kudos balance & workers\n"
+            "`.horde_models [image|text]` - List top active models on AI Horde\n"
+            "`.set_horde_model [name|reset]` - Set default AI Horde text model\n"
+            "`.set_provider <gemini|nvidia|horde|auto>` - Set preferred AI provider for channel\n"
             "`.ai_status` / `.airi_status` - Check active AI provider & memory state\n"
             "`.ai_reset` / `.clear_ai` - Reset conversation memory in channel\n"
             "`@Airi <message>` - Mention or reply to Airi for direct chat"
@@ -201,8 +219,9 @@ async def music(ctx):
 
 @help.command()
 async def server(ctx):
-    bot_roles = ctx.guild.get_member(client.user.id).roles
-    embed = discord.Embed(title="⚙ | Server Help",description="Use `.<command name` to activate !\n You need to give **certain permissions** to run a command !\n List of permissions can be found inside description of each command !",color=bot_roles[len(bot_roles)-1].color)
+    bot_roles = ctx.guild.get_member(client.user.id).roles if ctx.guild else None
+    embed_color = bot_roles[len(bot_roles)-1].color if bot_roles else discord.Color.blurple()
+    embed = discord.Embed(title="⚙ | Server Help",description="Use `.<command name` to activate !\n You need to give **certain permissions** to run a command !\n List of permissions can be found inside description of each command !",color=embed_color)
     embed.set_thumbnail(
         url = "https://media4.giphy.com/media/Fo5y4K3GD3RYijvsCS/giphy.gif")
     embed.add_field(name="Server Info",value = "`.si` gives information about Server",inline=False)
@@ -219,8 +238,9 @@ async def server(ctx):
 
 @help.command()
 async def fun(ctx):
-    bot_roles = ctx.guild.get_member(client.user.id).roles
-    embed = discord.Embed(title="🎮 | Fun Commands",description="Use `.<command name>` to activate !\n",color=bot_roles[len(bot_roles)-1].color)
+    bot_roles = ctx.guild.get_member(client.user.id).roles if ctx.guild else None
+    embed_color = bot_roles[len(bot_roles)-1].color if bot_roles else discord.Color.blurple()
+    embed = discord.Embed(title="🎮 | Fun Commands",description="Use `.<command name>` to activate !\n",color=embed_color)
     embed.set_thumbnail(url='https://i.gifer.com/Vx3x.gif')
     embed.add_field(name='Anime/Manga',value="> `.anime <name>` or `.manga <name>`",inline=False)
     embed.add_field(name='Wallpapers',value="> `.wall` get any random wallpaper\n> `.wall <name>` get wallpapers in the mentioned category")
@@ -230,8 +250,9 @@ async def fun(ctx):
 
 @help.command()
 async def liked(ctx):
-    bot_roles = ctx.guild.get_member(client.user.id).roles
-    embed = discord.Embed(title="♥ | Liked Commands",description="Airi allows you to save your favourite songs in cloud.\nYou can play your favourite songs anytime from any server.", color=bot_roles[len(bot_roles)-1].color)
+    bot_roles = ctx.guild.get_member(client.user.id).roles if ctx.guild else None
+    embed_color = bot_roles[len(bot_roles)-1].color if bot_roles else discord.Color.blurple()
+    embed = discord.Embed(title="♥ | Liked Commands",description="Airi allows you to save your favourite songs in cloud.\nYou can play your favourite songs anytime from any server.", color=embed_color)
     embed.set_thumbnail(url="https://media1.giphy.com/media/UXFWIX08KNkBVdg5Iy/giphy.gif?cid=6c09b952p6uen16tvz1yyvky2xlndq2uvy0r15y9fk69ntcl&rid=giphy.gif&ct=s")
     embed.add_field(name='Like a song',value="> `.like` Adds the song to your Liked songs playlist.",inline=True)
     embed.add_field(name='Dislike',value='> `.dl <number>` or `.dislike <no.>`',inline=True)
@@ -251,8 +272,16 @@ async def ai_help(ctx):
     )
     embed.set_thumbnail(url="https://cdn.pixilart.com/photos/large/ffc272ece387503.gif")
     embed.add_field(name="💬 Chat with Airi", value="> `.chat <your question>` or `.ask` / `.airi` / `.ai`", inline=False)
+    embed.add_field(name="🌸 Direct Gemini Chat", value="> `.gemini <question>` or `.g` - Chat directly with Google Gemini", inline=False)
+    embed.add_field(name="⚡ Direct NVIDIA NIM Chat", value="> `.nvidia <question>` or `.nim` - Chat directly with NVIDIA NIM", inline=False)
+    embed.add_field(name="🌐 Direct AI Horde Chat", value="> `.horde <question>` or `.aihorde` - Free crowdsourced LLMs", inline=False)
+    embed.add_field(name="🎨 AI Image Generation", value="> `.imagine <prompt>` or `.draw` - Create art via AI Horde Stable Diffusion", inline=False)
+    embed.add_field(name="⭐ AI Horde Kudos & Account", value="> `.kudos` - View Kudos balance, worker count, and usage stats", inline=False)
+    embed.add_field(name="📋 AI Horde Model List", value="> `.horde_models [image|text]` - View active cluster models & worker counts", inline=False)
+    embed.add_field(name="🔧 Set AI Horde Text Model", value="> `.set_horde_model <name|reset>` - Configure default text model", inline=False)
+    embed.add_field(name="🎛️ Set Preferred Provider", value="> `.set_provider <gemini|nvidia|horde|auto>` - Switch channel's default AI", inline=False)
     embed.add_field(name="🏷️ Mention & Reply", value="> Mention `@Airi <message>` or reply to any of Airi's messages directly!", inline=False)
-    embed.add_field(name="⚙️ AI Engine Status", value="> `.ai_status` - Check active provider (Local Moeru-AI, OpenRouter, Groq, OpenAI, Gemini, Ollama)", inline=False)
+    embed.add_field(name="⚙️ AI Engine Status", value="> `.ai_status` - Check active provider (Gemini, NVIDIA, Horde, OpenRouter, etc.)", inline=False)
     embed.add_field(name="🧹 Reset Memory", value="> `.ai_reset` or `.clear_ai` - Clears conversation history for the current channel", inline=False)
     await ctx.send(embed=embed)
 # COGS
@@ -278,11 +307,12 @@ async def reload(ctx, extension):
     await ctx.send(f"Reloaded `cogs.{extension}`")
 
 # run command
-token = env_config.get('DISCORD_BOT_TOKEN')
-if token:
-    client.run(token)
-else:
-    print(
-        "Error: DISCORD_BOT_TOKEN is missing.\n"
-        f"Copy .env.sample to {env_config.BASE_DIR / '.env'} and fill in your bot token."
-    )
+if __name__ == '__main__':
+    token = env_config.get('DISCORD_BOT_TOKEN')
+    if token:
+        client.run(token)
+    else:
+        print(
+            "Error: DISCORD_BOT_TOKEN is missing.\n"
+            f"Copy .env.sample to {env_config.BASE_DIR / '.env'} and fill in your bot token."
+        )

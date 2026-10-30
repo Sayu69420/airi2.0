@@ -10,10 +10,10 @@ moderation.
   names and streams the match from YouTube; audio is never pulled from
   Spotify directly), queueing, looping, shuffle, and a per-user liked-songs
   list.
-- **AI companion** — chats via mention, reply, or DM. Tries providers in
+- **AI companion & Art** — chats via mention, reply, or DM. Tries providers in
   order: a local/custom OpenAI-compatible server, NVIDIA NIM, OpenRouter,
-  Groq, OpenAI, Google Gemini, Ollama — falling back to canned replies if
-  none are configured. Conversation history persists per channel across
+  Groq, OpenAI, Google Gemini, Ollama, and [AI Horde](https://aihorde.net) — falling back to canned replies if
+  none are configured. Supports decentralized LLM text chat (`.horde`) and Stable Diffusion image generation (`.imagine` / `.draw`) powered by crowdsourced AI Horde workers. Conversation history persists per channel across
   restarts. Has a separate NSFW mode, gated to NSFW channels/DMs.
 - **Reddit** — random memes, subreddit browsing, NSFW image fetching (NSFW
   channels only).

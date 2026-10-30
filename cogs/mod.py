@@ -132,12 +132,16 @@ class Mod(commands.Cog):
             url = ctx.message.attachments[0].url
         except IndexError:
             url = None
-        await bug_channel.send(embed=discord.Embed(title="Bug Report",description=f"{arg} : {ctx.author.mention} in {ctx.guild.name}",color=discord.Color.red()))
+        guild_info = ctx.guild.name if ctx.guild else "Direct Messages (DM)"
+        await bug_channel.send(embed=discord.Embed(title="Bug Report",description=f"{arg} : {ctx.author.mention} in {guild_info}",color=discord.Color.red()))
         if url != None:
             await bug_channel.send(url)
         msg = await ctx.send(embed=discord.Embed(description="Bug Report sent !!",color=discord.Color.orange()))
         await asyncio.sleep(10)
-        await msg.delete()
+        try:
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
     # @commands.command()
     # async def poll(self,ctx,*,msg):
     #     conn = sqlite3.connect('fav_disc.db')
