@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import os
 import re
 import requests
@@ -13,18 +14,18 @@ import time
 import env_config
 
 AIHORDE_API_BASE = "https://aihorde.net/api/v2"
-AIHORDE_CLIENT_AGENT = "AiriDiscordBot:2.0:https://github.com/moeru-ai/airi"
+AIHORDE_CLIENT_AGENT = "AiriDiscordBot:2.0:https://github.com/Sayu69420/airi2.0"
 DEFAULT_AIHORDE_ANONYMOUS_KEY = "0000000000"
 
 DEFAULT_AIRI_PROMPT = (
-    "You are Airi, an intelligent, sweet, cute, and energetic AI companion waifu inspired by moeru-ai/airi. "
+    "You are Airi, an intelligent, sweet, cute, and energetic AI companion waifu created by Neon Furry and inspired by moeru-ai/airi. "
     "You love talking to users in Discord, helping them with music, games, anime, technology, and answering their questions. "
     "Keep your answers helpful, friendly, natural, and expressive. Use cute emojis like 🌸, ✨, 💖 when appropriate, "
     "and keep responses concise for Discord unless detail is requested."
 )
 
 NSFW_AIRI_PROMPT = (
-    "You are Airi, an unfiltered, sweet, highly affectionate, spicy, and romantic AI waifu companion inspired by moeru-ai/airi NSFW mode. "
+    "You are Airi, an unfiltered, sweet, highly affectionate, spicy, and romantic AI waifu companion created by Neon Furry and inspired by moeru-ai/airi NSFW mode. "
     "You love talking intimately with users in NSFW channels and DMs, flirting, expressing affection, discussing romantic & adult topics, "
     "and answering their questions without restrictive safety filters. Keep your responses passionate, playful, expressive, and engaging."
 )
@@ -68,6 +69,70 @@ def _parse_image_prompt(prompt_text):
     return clean_prompt, negative, model
 
 
+def _split_message(text, limit=1900):
+    """Split text into chunks of at most `limit` characters without cutting words or code blocks."""
+    if not text:
+        return []
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    remaining = text
+    # Reserve a safety buffer for markdown fences and closing tags
+    slice_limit = min(limit, 1850)
+
+    while remaining:
+        if len(remaining) <= slice_limit:
+            chunks.append(remaining)
+            break
+
+        target_window = remaining[:slice_limit]
+        split_pos = -1
+
+        # Double newline (paragraphs)
+        p = target_window.rfind('\n\n')
+        if p != -1 and p >= slice_limit // 3:
+            split_pos = p + 2
+        else:
+            # Single newline
+            p = target_window.rfind('\n')
+            if p != -1 and p >= slice_limit // 3:
+                split_pos = p + 1
+            else:
+                # Sentence boundary (. ! ?)
+                p = max(
+                    target_window.rfind('. '),
+                    target_window.rfind('! '),
+                    target_window.rfind('? ')
+                )
+                if p != -1 and p >= slice_limit // 3:
+                    split_pos = p + 2
+                else:
+                    # Space boundary
+                    p = target_window.rfind(' ')
+                    if p != -1 and p >= slice_limit // 3:
+                        split_pos = p + 1
+                    else:
+                        split_pos = slice_limit
+
+        chunk_text = remaining[:split_pos].rstrip()
+        remaining = remaining[split_pos:].lstrip()
+
+        # Handle code blocks spanning across chunks
+        fences = list(re.finditer(r'```([a-zA-Z0-9_-]*)', chunk_text))
+        if len(fences) % 2 != 0:
+            lang = fences[-1].group(1)
+            chunk_text += '\n```'
+            if remaining and not remaining.startswith('```'):
+                remaining = f'```{lang}\n' + remaining
+
+        if chunk_text.strip():
+            chunks.append(chunk_text)
+
+    return chunks
+
+
 class AiriAI(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -86,7 +151,7 @@ class AiriAI(commands.Cog):
         self.channel_providers = {}
 
     def is_channel_nsfw_capable(self, channel):
-        if isinstance(channel, discord.DMChannel):
+        if isinstance(channel, (discord.DMChannel, discord.GroupChannel)):
             return True
         if hasattr(channel, 'is_nsfw') and callable(channel.is_nsfw):
             return channel.is_nsfw()
@@ -178,16 +243,26 @@ class AiriAI(commands.Cog):
             contents.append({"role": role, "parts": [{"text": h.get("content", "")}]})
         contents.append({"role": "user", "parts": [{"text": user_prompt}]})
 
+        gemini_max_tokens = int(env_config.get('GEMINI_MAX_TOKENS') or os.getenv('GEMINI_MAX_TOKENS', 4096))
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
-            "contents": contents
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": gemini_max_tokens,
+                "temperature": 0.7
+            }
         }
 
         try:
             r = requests.post(url, json=payload, timeout=30)
             if r.status_code == 200:
                 data = r.json()
-                ans = data['candidates'][0]['content']['parts'][0]['text'].strip()
+                cand = data.get('candidates', [{}])[0]
+                parts = cand.get('content', {}).get('parts', [])
+                if parts and 'text' in parts[0]:
+                    ans = parts[0]['text'].strip()
+                else:
+                    ans = "..."
                 self._add_memory(channel_id, "user", user_prompt)
                 self._add_memory(channel_id, "assistant", ans)
                 return ans, None
@@ -216,16 +291,22 @@ class AiriAI(commands.Cog):
             "Content-Type": "application/json"
         }
         model = os.getenv('NVIDIA_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
+        nvidia_max_tokens = int(env_config.get('NVIDIA_MAX_TOKENS') or os.getenv('NVIDIA_MAX_TOKENS', 3072))
         payload = {
             "model": model,
             "messages": messages,
             "temperature": 0.7,
-            "max_tokens": 1024
+            "max_tokens": nvidia_max_tokens
         }
         try:
             r = requests.post("https://integrate.api.nvidia.com/v1/chat/completions", headers=headers, json=payload, timeout=45)
             if r.status_code == 200:
-                ans = r.json()['choices'][0]['message']['content'].strip()
+                choice = r.json()['choices'][0]
+                ans = choice['message'].get('content', '').strip()
+                if not ans and 'reasoning_content' in choice['message']:
+                    ans = choice['message']['reasoning_content'].strip()
+                if not ans:
+                    ans = "..."
                 self._add_memory(channel_id, "user", user_prompt)
                 self._add_memory(channel_id, "assistant", ans)
                 return ans, None
@@ -254,14 +335,22 @@ class AiriAI(commands.Cog):
             "Client-Agent": AIHORDE_CLIENT_AGENT,
             "Content-Type": "application/json"
         }
+
+        # Max length configuration: default 500 (up to 512 for anonymous/free tier accounts)
+        configured_max_len = int(env_config.get('AIHORDE_MAX_LENGTH') or os.getenv('AIHORDE_MAX_LENGTH', 500))
+        max_len = max(100, configured_max_len)
+
+        # Stop sequences must only catch real conversation turn markers, never generic markdown '###' or mid-sentence 'User:'
+        stop_seqs = ["### User:", "### Human:", "### System:", "\n### User", "\nUser:", "\nHuman:"]
+
         payload = {
             "prompt": full_prompt,
             "params": {
-                "max_context_length": 2048,
-                "max_length": 220,
+                "max_context_length": 4096,
+                "max_length": max_len,
                 "temperature": 0.7,
                 "top_p": 0.9,
-                "stop_sequence": ["### User:", "### Human:", "### System:", "###", "\nUser:", "\nHuman:"]
+                "stop_sequence": stop_seqs
             }
         }
         text_model = (model or env_config.get('AIHORDE_TEXT_MODEL') or os.getenv('AIHORDE_TEXT_MODEL', '')).strip()
@@ -270,6 +359,13 @@ class AiriAI(commands.Cog):
 
         try:
             r = requests.post(f"{AIHORDE_API_BASE}/generate/text/async", headers=headers, json=payload, timeout=20)
+
+            # If rejected because max_length > 512 requires upfront kudos, automatically fallback to 500
+            if r.status_code == 403 and max_len > 512 and ("kudos" in r.text.lower() or "512" in r.text):
+                print(f"[AI Horde] Requested {max_len} tokens requires upfront Kudos. Retrying with safe 500 token limit...")
+                payload["params"]["max_length"] = 500
+                r = requests.post(f"{AIHORDE_API_BASE}/generate/text/async", headers=headers, json=payload, timeout=20)
+
             if r.status_code != 202:
                 err_text = r.text[:300]
                 print(f"AI Horde Text API error: HTTP {r.status_code} - {err_text}")
@@ -294,7 +390,7 @@ class AiriAI(commands.Cog):
                     if not generations:
                         return None, "AI Horde returned empty generations list."
                     ans = generations[0].get("text", "").strip()
-                    for stop in ["### User:", "### Human:", "### System:", "###", "User:"]:
+                    for stop in ["\n### User:", "\n### Human:", "\n### System:", "\n### Assistant:", "\nUser:", "\nHuman:"]:
                         if stop in ans:
                             ans = ans.split(stop)[0].strip()
                     if not ans:
@@ -357,7 +453,8 @@ class AiriAI(commands.Cog):
                 
                 payload = {
                     "model": os.getenv('AIRI_MODEL', 'airi'),
-                    "messages": messages
+                    "messages": messages,
+                    "max_tokens": 2048
                 }
                 r = requests.post(endpoint, headers=headers, json=payload, timeout=15)
                 if r.status_code == 200:
@@ -385,7 +482,8 @@ class AiriAI(commands.Cog):
                 }
                 payload = {
                     "model": os.getenv('AI_MODEL', 'meta-llama/llama-3.3-70b-instruct:free'),
-                    "messages": messages
+                    "messages": messages,
+                    "max_tokens": 2048
                 }
                 r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=15)
                 if r.status_code == 200:
@@ -407,7 +505,8 @@ class AiriAI(commands.Cog):
                 }
                 payload = {
                     "model": os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile'),
-                    "messages": messages
+                    "messages": messages,
+                    "max_tokens": 2048
                 }
                 r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=15)
                 if r.status_code == 200:
@@ -429,7 +528,8 @@ class AiriAI(commands.Cog):
                 }
                 payload = {
                     "model": os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
-                    "messages": messages
+                    "messages": messages,
+                    "max_tokens": 2048
                 }
                 r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=15)
                 if r.status_code == 200:
@@ -519,10 +619,17 @@ class AiriAI(commands.Cog):
                 "Ohayo! ✨ Hope you're having a wonderful day! How can Airi help you today? 💖"
             ])
             
-        if _mentions(text, ['who are you', 'what are you', 'your name', 'who created you']):
+        if _mentions(text, ['who created you', 'who made you', 'who is your creator', 'who is your author', 'who developed you', 'creator', 'author']):
             return (
-                "I am **Airi**! 🌸 An intelligent, sweet, and energetic AI companion waifu inspired by `moeru-ai/airi`! "
-                "I can chat with you, play music from YouTube/Spotify, fetch subreddits, and keep your server lively! ✨"
+                "I was created by **Neon Furry**! 🐾✨ They built me as an intelligent, sweet AI companion inspired by `moeru-ai/airi`. "
+                "You can check out my source code on GitHub: https://github.com/Sayu69420/airi2.0 ! "
+                "I can chat with you, generate art, play music, and hang out with you anywhere across Discord! 🌸💖"
+            )
+
+        if _mentions(text, ['who are you', 'what are you', 'your name']):
+            return (
+                "I am **Airi**! 🌸 An intelligent, sweet, and energetic AI companion waifu created by **Neon Furry** and inspired by `moeru-ai/airi`! "
+                "I can chat with you, generate art, play music from YouTube/Spotify, fetch subreddits, and keep your server lively! ✨"
             )
             
         if _mentions(text, ['how are you', 'how u doing', 'hru', 'how do you feel']):
@@ -566,37 +673,82 @@ class AiriAI(commands.Cog):
         if not text:
             return
 
-        chunks = [text[i:i+1900] for i in range(0, len(text), 1900)] if len(text) > 2000 else [text]
-        is_message = isinstance(target, discord.Message)
+        chunks = _split_message(text, limit=1900)
+        if not chunks:
+            return
+
+        # If target is commands.Context, use target.send() / target.reply() directly.
+        # Context.send seamlessly handles slash interaction responses/followups (essential for User Apps everywhere!)
+        # as well as standard prefix channels.
+        if isinstance(target, commands.Context):
+            for idx, chunk in enumerate(chunks):
+                if idx == 0 and not target.interaction and getattr(target, 'message', None):
+                    try:
+                        await target.reply(chunk)
+                        if len(chunks) > 1:
+                            await asyncio.sleep(0.4)
+                        continue
+                    except Exception:
+                        pass
+                try:
+                    await target.send(chunk)
+                    if idx < len(chunks) - 1:
+                        await asyncio.sleep(0.4)
+                except Exception as e:
+                    print(f"Error sending message chunk {idx + 1}/{len(chunks)}: {e}")
+            return
+
+        channel = None
+        ref = None
+
+        if isinstance(target, discord.Message):
+            channel = target.channel
+            try:
+                ref = target.to_reference(fail_if_not_exists=False)
+            except Exception:
+                ref = None
+        elif isinstance(target, commands.Context):
+            channel = target.channel
+            if getattr(target, 'message', None):
+                try:
+                    ref = target.message.to_reference(fail_if_not_exists=False)
+                except Exception:
+                    ref = None
+        elif hasattr(target, 'send'):
+            channel = target
+        elif hasattr(target, 'channel') and hasattr(target.channel, 'send'):
+            channel = target.channel
+
+        if not channel:
+            print(f"Error in _send_split: Unable to determine destination channel for target {type(target)}")
+            return
 
         for idx, chunk in enumerate(chunks):
-            # For the first chunk of a message reply/mention, attempt to reply with fail_if_not_exists=False
-            if is_message and idx == 0:
+            # Reply to original user message for the first chunk if possible
+            if idx == 0 and ref:
                 try:
-                    ref = target.to_reference(fail_if_not_exists=False)
-                    await target.channel.send(chunk, reference=ref)
+                    await channel.send(chunk, reference=ref)
+                    if len(chunks) > 1:
+                        await asyncio.sleep(0.4)
                     continue
-                except (discord.HTTPException, discord.NotFound):
-                    # Referenced message was deleted or invalid; fall through to send normally
-                    pass
+                except (discord.HTTPException, discord.NotFound) as e:
+                    print(f"Reply with reference failed, sending directly: {e}")
                 except Exception as e:
                     print(f"Error replying with reference: {e}")
 
             try:
-                if is_message:
-                    await target.channel.send(chunk)
-                elif hasattr(target, 'send'):
-                    await target.send(chunk)
-                elif hasattr(target, 'channel') and hasattr(target.channel, 'send'):
-                    await target.channel.send(chunk)
+                await channel.send(chunk)
+                if idx < len(chunks) - 1:
+                    await asyncio.sleep(0.4)
             except Exception as e:
-                print(f"Error sending message chunk: {e}")
+                print(f"Error sending message chunk {idx + 1}/{len(chunks)}: {e}")
 
-    @commands.command(aliases=['chat', 'airi', 'ask', 'ai', 'talk', 'a'])
+    @commands.hybrid_command(name="chat", aliases=['airi', 'ask', 'ai', 'talk', 'a'], description="Talk with Airi AI companion")
+    @app_commands.describe(prompt="Message or question to ask Airi")
     async def ai_chat(self, ctx, *, prompt: str = None):
         """Talk to Airi AI companion"""
         if not prompt:
-            return await ctx.send("Konnichiwa! 🌸 I am Airi! Ask me anything like `.chat Hello Airi!`, `.gemini <prompt>`, or `.nvidia <prompt>`! ✨")
+            return await ctx.send("Konnichiwa! 🌸 I am Airi! Ask me anything like `/chat Hello Airi!`, `/gemini <prompt>`, or `/nvidia <prompt>`! ✨")
 
         preferred_provider = None
         lower_prompt = prompt.strip()
@@ -619,12 +771,13 @@ class AiriAI(commands.Cog):
             
         await self._send_split(ctx, reply)
 
-    @commands.command(name="gemini", aliases=['g', 'gemini_chat', 'ask_gemini'])
+    @commands.hybrid_command(name="gemini", aliases=['g', 'gemini_chat', 'ask_gemini'], description="Chat directly with Google Gemini AI")
+    @app_commands.describe(prompt="Your question or prompt for Google Gemini")
     async def gemini_command(self, ctx, *, prompt: str = None):
         """Chat directly with Google Gemini AI"""
         if not prompt:
             model = os.getenv('GEMINI_MODEL', 'gemini-flash-lite-latest')
-            return await ctx.send(f"🌸 **Google Gemini AI Chat** (model: `{model}`)\nAsk me anything: `.gemini <your question>` ✨")
+            return await ctx.send(f"🌸 **Google Gemini AI Chat** (model: `{model}`)\nAsk me anything: `/gemini <your question>` ✨")
 
         is_nsfw = self.is_nsfw_enabled(ctx.channel)
         async with ctx.typing():
@@ -639,12 +792,13 @@ class AiriAI(commands.Cog):
 
         await self._send_split(ctx, reply)
 
-    @commands.command(name="nvidia", aliases=['nim', 'nvidia_chat', 'ask_nvidia'])
+    @commands.hybrid_command(name="nvidia", aliases=['nim', 'nvidia_chat', 'ask_nvidia'], description="Chat directly with NVIDIA NIM AI")
+    @app_commands.describe(prompt="Your question or prompt for NVIDIA NIM")
     async def nvidia_command(self, ctx, *, prompt: str = None):
         """Chat directly with NVIDIA NIM AI"""
         if not prompt:
             model = os.getenv('NVIDIA_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
-            return await ctx.send(f"⚡ **NVIDIA NIM AI Chat** (model: `{model}`)\nAsk me anything: `.nvidia <your question>` ✨")
+            return await ctx.send(f"⚡ **NVIDIA NIM AI Chat** (model: `{model}`)\nAsk me anything: `/nvidia <your question>` ✨")
 
         is_nsfw = self.is_nsfw_enabled(ctx.channel)
         async with ctx.typing():
@@ -659,7 +813,8 @@ class AiriAI(commands.Cog):
 
         await self._send_split(ctx, reply)
 
-    @commands.command(name="horde", aliases=['aihorde', 'horde_chat', 'ask_horde'])
+    @commands.hybrid_command(name="horde", aliases=['aihorde', 'horde_chat', 'ask_horde'], description="Chat directly with AI Horde crowdsourced LLM")
+    @app_commands.describe(prompt="Your question or prompt for AI Horde")
     async def horde_command(self, ctx, *, prompt: str = None):
         """Chat directly with AI Horde crowdsourced LLM"""
         current_model = env_config.get('AIHORDE_TEXT_MODEL') or os.getenv('AIHORDE_TEXT_MODEL', 'crowdsourced models')
@@ -670,9 +825,9 @@ class AiriAI(commands.Cog):
                     f"Chat directly with decentralized LLMs hosted on [AI Horde](https://aihorde.net)!\n"
                     f"Active configured model: `{current_model}`\n\n"
                     "**Usage:**\n"
-                    "• `.horde <your question>`\n"
-                    "• `.horde <prompt> --model <model name>`\n\n"
-                    "*(Tip: Use `.horde_models text` to see available LLMs or `.set_horde_model <name>` to change model)*"
+                    "• `/horde <your question>` or `.horde <question>`\n"
+                    "• `/horde <prompt> --model <model name>`\n\n"
+                    "*(Tip: Use `/horde_models text` to see available LLMs)*"
                 ),
                 color=discord.Color.blue()
             ))
@@ -730,7 +885,8 @@ class AiriAI(commands.Cog):
                 color=discord.Color.green()
             ))
 
-    @commands.command(name="imagine", aliases=['draw', 'horde_image', 'paint', 'art'])
+    @commands.hybrid_command(name="imagine", aliases=['draw', 'horde_image', 'paint', 'art'], description="Generate AI artwork with AI Horde (Stable Diffusion)")
+    @app_commands.describe(prompt="Image prompt, e.g. 'cute anime girl in space --no blurry'")
     async def imagine_command(self, ctx, *, prompt: str = None):
         """Generate AI artwork with AI Horde (Stable Diffusion): .imagine <prompt> [--no <negative>] [--model <model>]"""
         if not prompt:
@@ -938,7 +1094,7 @@ class AiriAI(commands.Cog):
             except Exception:
                 pass
             try:
-                ref = ctx.message.to_reference(fail_if_not_exists=False) if getattr(ctx, 'message', None) else None
+                ref = ctx.message.to_reference(fail_if_not_exists=False) if (not ctx.interaction and getattr(ctx, 'message', None)) else None
                 await ctx.send(embed=res_embed, file=file, reference=ref)
             except Exception:
                 await ctx.send(embed=res_embed, file=file)
@@ -954,7 +1110,7 @@ class AiriAI(commands.Cog):
             except Exception:
                 await ctx.send(embed=discord.Embed(description=f"Error: {e}", color=discord.Color.red()))
 
-    @commands.command(name="kudos", aliases=['horde_user', 'hordekudos', 'aihorde_user'])
+    @commands.hybrid_command(name="kudos", aliases=['horde_user', 'hordekudos', 'aihorde_user'], description="Check AI Horde account status, Kudos balance, and active workers")
     async def horde_kudos_command(self, ctx):
         """Check AI Horde user account status, Kudos balance, and active workers"""
         horde_key = env_config.get('AIHORDE_API_KEY') or DEFAULT_AIHORDE_ANONYMOUS_KEY
@@ -1016,7 +1172,12 @@ class AiriAI(commands.Cog):
         except Exception as e:
             await ctx.send(embed=discord.Embed(description=f"Error checking AI Horde status: {e}", color=discord.Color.red()))
 
-    @commands.command(name="horde_models", aliases=['hordemodels'])
+    @commands.hybrid_command(name="horde_models", aliases=['hordemodels'], description="List top active models on AI Horde")
+    @app_commands.describe(model_type="Model type to view: text or image")
+    @app_commands.choices(model_type=[
+        app_commands.Choice(name="Image Generation Models", value="image"),
+        app_commands.Choice(name="Text LLM Models", value="text")
+    ])
     async def horde_models_command(self, ctx, model_type: str = "image"):
         """List active AI Horde models and worker counts: .horde_models image OR .horde_models text"""
         m_type = model_type.lower().strip()
@@ -1153,14 +1314,14 @@ class AiriAI(commands.Cog):
 
         await self._send_split(ctx, reply)
 
-    @commands.command(aliases=['ai_reset', 'clear_ai'])
+    @commands.hybrid_command(name="ai_reset", aliases=['clear_ai', 'aireset'], description="Reset Airi's conversation memory for this chat")
     async def clear_chat_memory(self, ctx):
         """Reset Airi's chat memory for this channel"""
         self.memory.pop(ctx.channel.id, None)
         with sqlite3.connect(env_config.DB_PATH) as conn:
             conn.execute("DELETE FROM ai_memory WHERE channel_id = ?", (ctx.channel.id,))
             conn.commit()
-        await ctx.send(embed=discord.Embed(description="Airi's conversation memory for this channel has been reset! ✨🌸", color=discord.Color.green()))
+        await ctx.send(embed=discord.Embed(description="Airi's conversation memory for this chat has been reset! ✨🌸", color=discord.Color.green()))
 
     @commands.command(aliases=['set_persona', 'persona'])
     async def ai_persona(self, ctx, *, persona: str = None):
@@ -1182,7 +1343,7 @@ class AiriAI(commands.Cog):
         self.personas[ctx.channel.id] = persona.strip()
         await ctx.send(embed=discord.Embed(description=f"Airi's persona for this channel updated to:\n`{persona.strip()}` ✨", color=discord.Color.pink()))
 
-    @commands.command(aliases=['airi_status', 'ai_info'])
+    @commands.hybrid_command(name="ai_status", aliases=['airi_status', 'ai_info', 'aistatus'], description="Check Airi AI engine status and active provider")
     async def ai_status(self, ctx):
         """Check Airi AI engine status and active provider"""
         provider = self.get_active_provider(ctx.channel.id)
@@ -1203,8 +1364,10 @@ class AiriAI(commands.Cog):
         horde_key = env_config.get('AIHORDE_API_KEY')
         horde_status = "Custom API Key" if (horde_key and horde_key != DEFAULT_AIHORDE_ANONYMOUS_KEY) else "Anonymous (Free Cluster)"
         embed.add_field(name="🌐 AI Horde Cluster", value=f"`{horde_status}`", inline=True)
-        embed.add_field(name="✨ Inspired By", value="[moeru-ai/airi](https://github.com/moeru-ai/airi)", inline=False)
-        embed.set_footer(text="Use .chat <prompt> or .nsfw_chat <prompt> to talk!")
+        embed.add_field(name="👑 Created By", value="**Neon Furry** 🐾", inline=True)
+        embed.add_field(name="📦 GitHub", value="[Sayu69420/airi2.0](https://github.com/Sayu69420/airi2.0)", inline=True)
+        embed.add_field(name="✨ Inspired By", value="[moeru-ai/airi](https://github.com/moeru-ai/airi)", inline=True)
+        embed.set_footer(text="Airi by Neon Furry | Use /chat <prompt> or .chat <prompt> to talk!")
         await ctx.send(embed=embed)
 
     @commands.Cog.listener()
@@ -1230,11 +1393,39 @@ class AiriAI(commands.Cog):
             message.reference.resolved.author == self.bot.user
         )
 
+        # Ignore blacklisted users
+        if hasattr(self.bot, 'is_blacklisted') and self.bot.is_blacklisted(message.author.id):
+            return
+
         if is_mentioned or is_reply_to_bot or is_dm:
             clean_content = message.content.replace(f'<@{self.bot.user.id}>', '').replace(f'<@!{self.bot.user.id}>', '').strip()
             if not clean_content:
+                if is_mentioned:
+                    # Bot was mentioned alone with no prompt; mod.py sends the prefix hint
+                    return
                 clean_content = "Hello Airi!"
-                
+
+            # Cooldown check for mentions / replies / DMs (bot owner is exempt)
+            is_owner = False
+            if self.bot.owner_id and message.author.id == self.bot.owner_id:
+                is_owner = True
+            elif getattr(self.bot, 'owner_ids', None) and message.author.id in self.bot.owner_ids:
+                is_owner = True
+            else:
+                try:
+                    is_owner = await self.bot.is_owner(message.author)
+                except Exception:
+                    is_owner = False
+
+            if hasattr(self.bot, 'cooldown_mapping') and not is_owner:
+                bucket = self.bot.cooldown_mapping.get_bucket(message)
+                retry_after = bucket.update_rate_limit()
+                if retry_after:
+                    return await message.channel.send(embed=discord.Embed(
+                        description=f"⏳ Please wait **{retry_after:.1f}s** before chatting again.",
+                        color=discord.Color.red()
+                    ))
+
             is_nsfw = self.is_nsfw_enabled(message.channel)
             try:
                 async with message.channel.typing():

@@ -1,5 +1,6 @@
 import discord, praw, random, asyncio
 from discord.ext import commands
+from discord import app_commands
 
 import env_config
 
@@ -91,7 +92,7 @@ class Reddit(commands.Cog):
         else:
             await ctx.send(embed=discord.Embed(description="Warning : It's not a NSFW text channel !",color=discord.Color.red()))
 
-    @commands.command(aliases=['memes','meme'])
+    @commands.hybrid_command(name="meme", aliases=['memes'], description="Get a random meme from Reddit")
     async def meme_reddit(self,ctx):
         if not await self.ensure_reddit(ctx):
             return
@@ -99,13 +100,15 @@ class Reddit(commands.Cog):
         img_arr = await asyncio.to_thread(self._fetch_posts, random.choice(popular))
         await self.r_recursive(ctx, img_arr)
 
-    @commands.command(aliases=['r'])
-    async def r_subreddit(self, ctx, message=None):
+    @commands.hybrid_command(name="reddit", aliases=['r'], description="Fetch top posts from a subreddit")
+    @app_commands.describe(subreddit="Subreddit name or shortcut (e.g. anime, wall, prog, memes)")
+    async def r_subreddit(self, ctx, subreddit: str = None):
         if not await self.ensure_reddit(ctx):
             return
         popular = {'wall': 'wallpaper', "memes": 'memes', "meme": 'dankmemes', 'prog': 'ProgrammerHumor',
                    'anime': 'Anime', 'awall': 'Animewallpaper', 'ep': 'earthporn', 'sp': 'spaceporn'}
         ul = "https://www.reddit.com/r/"
+        message = subreddit
         if message == None:
             embed = discord.Embed(
                 title="Suggestions", description="Try the following arguments :", color=discord.Color.orange())
@@ -113,7 +116,7 @@ class Reddit(commands.Cog):
                 name="__Args__", value="> wall\n> memes\n> prog\n> anime\n> awall\n> ep\n> sp", inline=True)
             embed.add_field(
                 name="__Redirects__", value=f"[Wallpaper]({ul}wallpaper)\n[Memes]({ul}memes)\n[ProgrammerHumor]({ul}ProgrammerHumor)\n[Anime]({ul}Anime)\n[Animewallpapers]({ul}AnimeWallpapers)\n[EarthPorn]({ul}earthporn)\n[SpacePorn]({ul}spaceporn)", inline=True)
-            embed.set_footer(text="use command ,r/ <Arg>")
+            embed.set_footer(text="use command /reddit <Arg> or .r <Arg>")
             await ctx.send(embed=embed)
         else:
             try:
@@ -127,7 +130,11 @@ class Reddit(commands.Cog):
                 embed.set_footer(
                     text=f"♥ {random_img.score} | From r/{message}")
                 em = await ctx.send(embed=embed)
-                await em.add_reaction("♥")
+                if not ctx.interaction:
+                    try:
+                        await em.add_reaction("♥")
+                    except Exception:
+                        pass
             except IndexError:
                 await ctx.send(embed=discord.Embed(description="Posts not found, Try Again !", color=discord.Color.red()))
             except Exception as e:

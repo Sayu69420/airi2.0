@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS ai_memory(
     created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_ai_memory_channel ON ai_memory(channel_id, id);
+CREATE TABLE IF NOT EXISTS blacklist(
+    user_id INTEGER PRIMARY KEY,
+    reason TEXT,
+    added_at TEXT DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS _migrations(
     name TEXT PRIMARY KEY,
     applied_at TEXT
@@ -129,6 +134,64 @@ def get_id(name):
     """Return a Discord snowflake from the environment, or None if unset/invalid."""
     raw = get(name)
     return int(raw) if raw.isdigit() else None
+
+
+def get_client_id(explicit_id=None):
+    """Return the Discord application / client ID from explicit id, env, or derived from bot token."""
+    if explicit_id:
+        return str(explicit_id)
+    env_id = get("CLIENT_ID") or get("DISCORD_CLIENT_ID")
+    if env_id:
+        return env_id
+    token = get("DISCORD_BOT_TOKEN")
+    if token and "." in token:
+        try:
+            import base64
+            part = token.split(".")[0]
+            padded = part + "=" * (-len(part) % 4)
+            cid = base64.b64decode(padded).decode("utf-8", errors="ignore")
+            if cid.isdigit():
+                return cid
+        except Exception:
+            pass
+    return "1532368781094162472"
+
+
+GITHUB_URL = "https://github.com/Sayu69420/airi2.0"
+
+DEFAULT_BOT_INVITE_URL = (
+    "https://discord.com/oauth2/authorize?client_id=1532368781094162472&permissions=8&integration_type=0&scope=bot%20applications.commands"
+)
+
+
+def get_bot_invite_url(client_id=None):
+    """Return the Discord OAuth2 URL to invite Airi to a Discord server (Guild install)."""
+    custom = get("BOT_INVITE_URL")
+    if custom:
+        return custom
+    cid = get_client_id(client_id)
+    return (
+        f"https://discord.com/oauth2/authorize?client_id={cid}"
+        f"&permissions=8&integration_type=0&scope=bot%20applications.commands"
+    )
+
+
+def get_user_install_url(client_id=None):
+    """Return the Discord OAuth2 URL to install Airi to a User's Profile (Use Everywhere)."""
+    custom = get("USER_INSTALL_URL")
+    if custom:
+        return custom
+    cid = get_client_id(client_id)
+    return (
+        f"https://discord.com/oauth2/authorize?client_id={cid}"
+        f"&integration_type=1&scope=applications.commands"
+    )
+
+
+def get_universal_install_url(client_id=None):
+    """Return the general Discord OAuth2 authorize URL allowing server invite or user install."""
+    cid = get_client_id(client_id)
+    return f"https://discord.com/oauth2/authorize?client_id={cid}"
 
 
 init_db()

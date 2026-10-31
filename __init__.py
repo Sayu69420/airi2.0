@@ -92,7 +92,7 @@ async def help(ctx):
     embed.add_field(name="😸| Fun Commands",value=".help fun",inline=True)
     embed.add_field(name="⚙| Manage Server",value=".help server",inline=False)
     embed.add_field(name="🧬| Covid-19",value=".help covid",inline=True)
-    embed.add_field(name="\u200b", value=f"[Add me to your server !](https://discord.com/api/oauth2/authorize?client_id=BOT_ID&permissions=0&scope=bot)",inline=False)
+    embed.add_field(name="\u200b", value="[Add me to your server !](https://discord.com/oauth2/authorize?client_id=1532368781094162472&permissions=8&integration_type=0&scope=bot)",inline=False)
     await ctx.send(embed=embed)
 
 @help.command(name="commands", aliases=["all", "list"])

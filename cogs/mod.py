@@ -1,6 +1,7 @@
 import discord
 import asyncio
 from discord.ext import commands
+from discord import app_commands
 
 import env_config
 
@@ -11,10 +12,15 @@ class Mod(commands.Cog):
         self.afk = []
         self.poll_ids = []
 
+    @commands.guild_only()
     @commands.has_permissions(manage_messages=True)
     @commands.command(aliases=['mute'])
     async def _mute(self, ctx, member: discord.Member, time: int = None):
-        await ctx.message.add_reaction("👌")
+        if not ctx.interaction and getattr(ctx, 'message', None):
+            try:
+                await ctx.message.add_reaction("👌")
+            except Exception:
+                pass
         guild = ctx.guild
         muted_id = member.id
         if muted_id not in self.mute:
@@ -41,10 +47,15 @@ class Mod(commands.Cog):
             embed = discord.Embed(description=f'{member.name} is free to speak now.', color=discord.Color.green())
             await ctx.send(embed=embed)
 
+    @commands.guild_only()
     @commands.has_permissions(manage_messages=True)
     @commands.command(aliases=['unmute'])
     async def _unmute(self, ctx, member: discord.Member):
-        await ctx.message.add_reaction("👌")
+        if not ctx.interaction and getattr(ctx, 'message', None):
+            try:
+                await ctx.message.add_reaction("👌")
+            except Exception:
+                pass
         guild = ctx.guild
         muted_id = member.id
         role = discord.utils.get(guild.roles, name='Mute')
@@ -58,18 +69,20 @@ class Mod(commands.Cog):
             embed = discord.Embed(description=f'{member.name} was not muted.', color=discord.Color.green())
             await ctx.send(embed=embed)
 
-    @commands.command(aliases=['ping'])
+    @commands.hybrid_command(name="ping", description="Check Airi bot latency")
     async def ping_(self,ctx):
-        embed = discord.Embed(description=f'pong ! {str(round(self.client.latency*1000))}ms',color=discord.Color.blurple())
-        await ctx.reply(embed=embed)
+        embed = discord.Embed(description=f'🏓 Pong! Latency: **{round(self.client.latency*1000)}ms**',color=discord.Color.blurple())
+        await ctx.send(embed=embed)
 
+    @commands.guild_only()
     @commands.has_permissions(manage_messages=True)
     @commands.command(aliases=['purge','del','delete'])
     async def delete_(self,ctx,num=1):
         await ctx.channel.purge(limit = num+1)
 
-    @commands.command(aliases=['afk'])
-    async def afk_(self, ctx, *, reason='Not Given'):
+    @commands.hybrid_command(name="afk", description="Set or clear your AFK status")
+    @app_commands.describe(reason="Reason for going AFK")
+    async def afk_(self, ctx, *, reason: str = 'Not Given'):
         user_id = ctx.author.id
         if user_id in [u.id for u in self.afk]:
             self.afk = [u for u in self.afk if u.id != user_id]
@@ -85,6 +98,10 @@ class Mod(commands.Cog):
         if message.author.bot:
             return
 
+        # Ignore blacklisted users
+        if hasattr(self.client, 'is_blacklisted') and self.client.is_blacklisted(message.author.id):
+            return
+
         # Check if author is AFK and remove AFK status
         afk_user_ids = [u.id for u in self.afk]
         if message.author.id in afk_user_ids:
@@ -98,8 +115,9 @@ class Mod(commands.Cog):
                 embed = discord.Embed(description=f"**{member.name}** is currently AFK!", color=discord.Color.red())
                 await message.channel.send(embed=embed)
 
-        # Check if bot was mentioned
-        if self.client.user in message.mentions:
+        # Check if bot was mentioned alone with no other text
+        clean_content = message.content.replace(f'<@{self.client.user.id}>', '').replace(f'<@!{self.client.user.id}>', '').strip()
+        if not clean_content and self.client.user in message.mentions:
             embed = discord.Embed(description="My prefix is `.`", color=discord.Color.blurple())
             await message.channel.send(embed=embed)
 
@@ -118,9 +136,35 @@ class Mod(commands.Cog):
         # embed = discord.Embed(description="use `join vc <@person>` or `join tc <@person>`")
 
     @commands.command(aliases=['invite'])
-    async def create_invite(self, ctx,age=5):
-        link = await ctx.channel.create_invite(max_age=age*60)
-        await ctx.send(f"**Timeout: {age} Minutes** {link}")
+    async def create_invite(self, ctx, age: str = "5"):
+        if age.lower() in ["bot", "airi", "me", "add"]:
+            invite_url = env_config.get_bot_invite_url(self.client.user.id if self.client.user else None)
+            user_install_url = env_config.get_user_install_url(self.client.user.id if self.client.user else None)
+            embed = discord.Embed(
+                title="🤖 Invite Airi or Install Everywhere",
+                description=(
+                    f"Choose how you want to add **Airi**:\n\n"
+                    f"🏠 **[Add to Server (Guild)]({invite_url})**\n"
+                    f"Add Airi to your Discord server for music, moderation, and AI chat.\n\n"
+                    f"🌐 **[Add to Profile (Use Everywhere)]({user_install_url})**\n"
+                    f"Install Airi directly to your Discord account to use slash commands (`/chat`, `/imagine`, `/ping`, etc.) everywhere across Discord!"
+                ),
+                color=discord.Color.blurple()
+            )
+            if self.client.user and self.client.user.avatar:
+                embed.set_thumbnail(url=self.client.user.avatar.url)
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Add to Server", url=invite_url, style=discord.ButtonStyle.link, emoji="🤖"))
+            view.add_item(discord.ui.Button(label="Add to Profile (Everywhere)", url=user_install_url, style=discord.ButtonStyle.link, emoji="🌐"))
+            return await ctx.send(embed=embed, view=view)
+
+        try:
+            minutes = int(age)
+        except ValueError:
+            return await ctx.send("Please provide a valid timeout in minutes (e.g. `.invite 10`) or use `.invite bot` to invite Airi.")
+
+        link = await ctx.channel.create_invite(max_age=minutes*60)
+        await ctx.send(f"**Timeout: {minutes} Minutes** {link}")
 
     @commands.command(aliases=['bug','report'])
     async def bug_report(self,ctx,*,arg):

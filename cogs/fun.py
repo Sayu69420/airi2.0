@@ -1,5 +1,6 @@
 import discord, asyncio, random, requests
 from discord.ext import commands
+from discord import app_commands
 
 import env_config
 
@@ -10,13 +11,48 @@ class Task(commands.Cog):
         self.client = client
         self.r_store = []
 
-    @commands.command(aliases=['hi','hii','hello'])
+    @commands.hybrid_command(name="hi", aliases=['hii','hello'], description="Say hello to Airi")
     async def _hey(self,ctx):
-        await ctx.reply("Hello !")
-        await ctx.message.add_reaction("🧡")
+        await ctx.reply("Hello ! 🌸")
+        if not ctx.interaction and getattr(ctx, 'message', None):
+            try:
+                await ctx.message.add_reaction("🧡")
+            except Exception:
+                pass
 
-    @commands.command(aliases=['anime'])
-    async def anime_(self, ctx, *, arg):
+    @commands.hybrid_command(name="about", aliases=['creator', 'author'], description="About Airi and author Neon Furry")
+    async def about_command(self, ctx):
+        """Information about Airi and author Neon Furry."""
+        invite_url = env_config.get_bot_invite_url(self.client.user.id if self.client.user else None)
+        user_install_url = env_config.get_user_install_url(self.client.user.id if self.client.user else None)
+
+        embed = discord.Embed(
+            title="🌸 About Airi & Creator",
+            description=(
+                "**Airi 2.0** is an intelligent, sweet, and cute multi-purpose Discord bot & AI companion.\n"
+                "Members can use Airi in servers or install her directly to their user profiles to chat and use slash commands everywhere across Discord!\n\n"
+                "👑 **Author / Creator:** **Neon Furry** 🐾\n"
+                "📦 **GitHub:** [Sayu69420/airi2.0](https://github.com/Sayu69420/airi2.0)\n"
+                "💡 **Inspired By:** [moeru-ai/airi](https://github.com/moeru-ai/airi)\n"
+                "⚡ **Framework:** discord.py 2.7\n"
+                "✨ **Features:** AI Companion (`/chat`), Image Generation (`/imagine`), Music Streaming, Memes, Anime/Manga, and User App Install"
+            ),
+            color=discord.Color.from_rgb(255, 182, 193)
+        )
+        if self.client.user and self.client.user.avatar:
+            embed.set_thumbnail(url=self.client.user.avatar.url)
+        embed.set_footer(text="Created with 💖 by Neon Furry | Airi 2.0")
+
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="Invite to Server", url=invite_url, style=discord.ButtonStyle.link, emoji="🤖"))
+        view.add_item(discord.ui.Button(label="Install to Profile (Everywhere)", url=user_install_url, style=discord.ButtonStyle.link, emoji="🌐"))
+        view.add_item(discord.ui.Button(label="GitHub", url="https://github.com/Sayu69420/airi2.0", style=discord.ButtonStyle.link, emoji="⭐"))
+        await ctx.send(embed=embed, view=view)
+
+    @commands.hybrid_command(name="anime", description="Search anime information")
+    @app_commands.describe(title="Name of the anime")
+    async def anime_(self, ctx, *, title: str):
+        arg = title
         try:
             headers = {'User-Agent': 'AiriBot/1.0'}
             response = await asyncio.to_thread(
@@ -59,8 +95,10 @@ class Task(commands.Cog):
             print(f"Anime lookup error: {type(e).__name__}: {e}")
             await ctx.send(embed=discord.Embed(description="Failed to get anime info. Try again later!", color=discord.Color.red()))
 
-    @commands.command(aliases=['manga'])
-    async def manga_(self, ctx, *, arg):
+    @commands.hybrid_command(name="manga", description="Search manga information")
+    @app_commands.describe(title="Name of the manga")
+    async def manga_(self, ctx, *, title: str):
+        arg = title
         try:
             headers = {'User-Agent': 'AiriBot/1.0'}
             response = await asyncio.to_thread(
@@ -103,8 +141,10 @@ class Task(commands.Cog):
             print(f"Manga lookup error: {type(e).__name__}: {e}")
             await ctx.send(embed=discord.Embed(description="Failed to get manga info. Try again later!", color=discord.Color.red()))
 
-    @commands.command(aliases=['pic'])
-    async def get_img(self, ctx, person: discord.Member):
+    @commands.hybrid_command(name="pic", aliases=['avatar'], description="Display a user's avatar / profile picture")
+    @app_commands.describe(user="User whose profile picture to show (defaults to you)")
+    async def get_img(self, ctx, user: discord.User = None):
+        person = user or ctx.author
         avatar = person.display_avatar
         pic_url_jpg = avatar.with_format('jpg').with_size(1024).url
         pic_url_jpeg = avatar.with_format('jpeg').with_size(1024).url
@@ -153,7 +193,8 @@ class Task(commands.Cog):
         # except:
             # await ctx.send(embed = discord.Embed(description="Referenced message not found !!",color=discord.Color.red()))
 
-    @commands.command(aliases=['wall', 'wallpaper'])
+    @commands.hybrid_command(name="wallpaper", aliases=['wall'], description="Search and fetch high quality wallpapers")
+    @app_commands.describe(query="Wallpaper search term or category")
     async def wallp_(self, ctx, *, query: str = None):
         client_id = env_config.get('UNSPLASH_CLIENT_ID')
         page = random.randint(1, 5)
@@ -181,7 +222,11 @@ class Task(commands.Cog):
                         embed.set_image(url=raw_url)
                         embed.set_footer(text=f"Picture from {username}", icon_url=profile_img)
                         msg = await ctx.send(embed=embed)
-                        await msg.add_reaction("♥")
+                        if not ctx.interaction:
+                            try:
+                                await msg.add_reaction("♥")
+                            except Exception:
+                                pass
                         return
             except Exception as e:
                 print(f"Unsplash API error: {e}")
@@ -206,7 +251,11 @@ class Task(commands.Cog):
                     embed.set_image(url=img_url)
                     embed.set_footer(text=f"Resolution: {dimension} | Wallhaven")
                     msg = await ctx.send(embed=embed)
-                    await msg.add_reaction("♥")
+                    if not ctx.interaction:
+                        try:
+                            await msg.add_reaction("♥")
+                        except Exception:
+                            pass
                     return
                 else:
                     return await ctx.send(embed=discord.Embed(description=f"No wallpapers found for `{query}`!", color=discord.Color.red()))
